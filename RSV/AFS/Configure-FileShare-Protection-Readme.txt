@@ -69,10 +69,10 @@ INPUTS (PROMPTED AT RUNTIME)
     - Choose from discovered Azure File Share backup policies by number
 
 
-API VERSIONS USED
------------------
-  - 2016-12-01   Container verification, inquire (discover file shares)
-  - 2019-05-13   Protectable items, backup policies, enable protection
+API VERSION USED
+----------------
+  - 2025-08-01   All operations (container verification, inquire, protectable items,
+                 backup policies, enable protection)
 
 
 EXAMPLES

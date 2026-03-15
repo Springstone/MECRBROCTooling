@@ -77,10 +77,9 @@ INPUTS (PROMPTED AT RUNTIME)
     - User must type "yes" or "y" to proceed
 
 
-API VERSIONS USED
------------------
-  - 2025-08-01   Container GET, container DELETE (unregister)
-  - 2019-05-13   Protected items query (to check for remaining items)
+API VERSION USED
+----------------
+  - 2025-08-01   All operations (container GET, container DELETE, protected items query)
 
 
 EXAMPLES

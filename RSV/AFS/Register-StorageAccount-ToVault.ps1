@@ -25,7 +25,7 @@
 # CONFIGURATION
 # ============================================================================
 
-$apiVersion = "2016-12-01"  # Azure Backup REST API version
+$apiVersion = "2025-08-01"  # Azure Backup REST API version
 
 # ============================================================================
 # RUNTIME INPUT COLLECTION
@@ -119,12 +119,15 @@ $authMethod = $null
 
 # Try Azure PowerShell first
 try {
-    $tokenResult = Get-AzAccessToken -ResourceUrl "https://management.azure.com"
-    # Az.Accounts >= 2.13.0 returns SecureString; older versions return plain string
-    if ($tokenResult.Token -is [System.Security.SecureString]) {
-        $token = $tokenResult.Token | ConvertFrom-SecureString -AsPlainText
+    $tokenResponse = Get-AzAccessToken -ResourceUrl "https://management.azure.com"
+    # Az module 12+ returns SecureString for .Token; older versions return plain string
+    if ($tokenResponse.Token -is [System.Security.SecureString]) {
+        $token = $tokenResponse.Token | ConvertFrom-SecureString -AsPlainText
     } else {
-        $token = $tokenResult.Token
+        $token = $tokenResponse.Token
+    }
+    if ([string]::IsNullOrWhiteSpace($token) -or $token.Length -lt 100) {
+        throw "Token appears invalid (length: $($token.Length))"
     }
     $authMethod = "Azure PowerShell"
     Write-Host "  Authentication successful (Azure PowerShell)" -ForegroundColor Green

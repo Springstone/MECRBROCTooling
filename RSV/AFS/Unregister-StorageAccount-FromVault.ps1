@@ -42,8 +42,7 @@
 # CONFIGURATION
 # ============================================================================
 
-$apiVersion = "2025-08-01"       # Azure Backup REST API version for container operations
-$protectionApiVersion = "2019-05-13"  # For protected items query
+$apiVersion = "2025-08-01"  # Azure Backup REST API version
 
 # Load System.Web for URL encoding (required in PowerShell 7)
 Add-Type -AssemblyName System.Web
@@ -132,12 +131,14 @@ $authMethod = $null
 
 # Try Azure PowerShell first
 try {
-    $tokenResult = Get-AzAccessToken -ResourceUrl "https://management.azure.com"
-    # Az.Accounts >= 2.13.0 returns SecureString; older versions return plain string
-    if ($tokenResult.Token -is [System.Security.SecureString]) {
-        $token = $tokenResult.Token | ConvertFrom-SecureString -AsPlainText
+    $tokenResponse = Get-AzAccessToken -ResourceUrl "https://management.azure.com"
+    if ($tokenResponse.Token -is [System.Security.SecureString]) {
+        $token = $tokenResponse.Token | ConvertFrom-SecureString -AsPlainText
     } else {
-        $token = $tokenResult.Token
+        $token = $tokenResponse.Token
+    }
+    if ([string]::IsNullOrWhiteSpace($token) -or $token.Length -lt 100) {
+        throw "Token appears invalid (length: $($token.Length))"
     }
     $authMethod = "Azure PowerShell"
     Write-Host "  Authentication successful (Azure PowerShell)" -ForegroundColor Green
@@ -244,7 +245,7 @@ Write-Host ""
 
 Write-Host "Checking for protected file shares in this storage account..." -ForegroundColor Cyan
 
-$listProtectedItemsUri = "https://management.azure.com/subscriptions/$vaultSubscriptionId/resourceGroups/$vaultResourceGroup/providers/Microsoft.RecoveryServices/vaults/$vaultName/backupProtectedItems?api-version=$protectionApiVersion&`$filter=backupManagementType eq 'AzureStorage'"
+$listProtectedItemsUri = "https://management.azure.com/subscriptions/$vaultSubscriptionId/resourceGroups/$vaultResourceGroup/providers/Microsoft.RecoveryServices/vaults/$vaultName/backupProtectedItems?api-version=$apiVersion&`$filter=backupManagementType eq 'AzureStorage'"
 
 $hasProtectedItems = $false
 
@@ -282,11 +283,11 @@ try {
                 Write-Host ""
                 Write-Host "  Steps:" -ForegroundColor Yellow
                 Write-Host "    1. Stop protection with retain data: use Stop-FileShare-Protection.ps1" -ForegroundColor White
-                Write-Host "    3. Then re-run this script to unregister" -ForegroundColor White
+                Write-Host "    2. Then re-run this script to unregister" -ForegroundColor White
                 Write-Host ""
                 exit 1
             } else {
-                Write-Host "  All items have stopped protection with retain data. Unregister can proceed." -ForegroundColor Green
+                Write-Host "  No active protected items. Unregister can proceed." -ForegroundColor Green
                 Write-Host ""
             }
         } else {
@@ -363,8 +364,9 @@ try {
         Write-Host ""
         
         # Track operation via Location or Azure-AsyncOperation header
-        $locationUrl = $deleteResponse.Headers["Location"]
-        $asyncUrl = $deleteResponse.Headers["Azure-AsyncOperation"]
+        # PS7 returns headers as String[] — take first element
+        $locationUrl = $deleteResponse.Headers["Location"] | Select-Object -First 1
+        $asyncUrl = $deleteResponse.Headers["Azure-AsyncOperation"] | Select-Object -First 1
         $trackingUrl = if ($asyncUrl) { $asyncUrl } else { $locationUrl }
         
         if ($trackingUrl) {
