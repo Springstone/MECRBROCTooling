@@ -47,6 +47,12 @@
     The name of the SQL database to restore. If not specified, the script will 
     list all protected databases on the VM and prompt for selection.
 
+.PARAMETER InstanceName
+    The name of the SQL instance (e.g. MSSQLSERVER, SQLEXPRESS).
+    When specified, filters protected databases to only those belonging
+    to this instance. Useful when a VM has multiple SQL instances and 
+    the same database name exists in more than one.
+
 .PARAMETER RestoreType
     The type of restore to perform. Valid values: ALR, RestoreAsFiles.
     - ALR: Alternate Location Restore (restore to different DB name/VM)
@@ -145,6 +151,9 @@ param(
 
     [Parameter(Mandatory = $false, HelpMessage = "Name of the SQL database to restore. If omitted, available databases will be listed for selection.")]
     [string]$DatabaseName,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Name of the SQL instance to target (e.g. MSSQLSERVER). Filters databases to this instance.")]
+    [string]$InstanceName,
 
     [Parameter(Mandatory = $true, HelpMessage = "Type of restore: ALR (Alternate Location), RestoreAsFiles.")]
     [ValidateSet("ALR", "RestoreAsFiles")]
@@ -433,11 +442,16 @@ try {
     
     # Handle both old (plain string) and new (SecureString) Az.Accounts module versions
     if ($tokenResponse.Token -is [System.Security.SecureString]) {
-        $token = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
-            [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($tokenResponse.Token)
-        )
+        # Use NetworkCredential trick - works reliably on both Windows and Linux
+        $token = [System.Net.NetworkCredential]::new('', $tokenResponse.Token).Password
     } else {
         $token = $tokenResponse.Token
+    }
+    
+    # Validate token looks like a JWT (starts with eyJ)
+    if (-not $token.StartsWith("eyJ")) {
+        Write-Host "  WARNING: Token does not appear to be a valid JWT. Trying Azure CLI fallback..." -ForegroundColor Yellow
+        throw "Invalid token format"
     }
     
     $authMethod = "Azure PowerShell"
@@ -525,26 +539,93 @@ try {
     Write-Host "  Found $($vmProtectedDBs.Count) protected SQL database(s) on VM '$vmName'" -ForegroundColor Green
     Write-Host ""
     
-    $dbIdx = 1
-    foreach ($db in $vmProtectedDBs) {
-        $state = $db.properties.protectionState
-        $policy = $db.properties.policyName
-        $lastBackup = $db.properties.lastBackupTime
-        
-        Write-Host "  [$dbIdx] $($db.properties.friendlyName)" -ForegroundColor White
-        Write-Host "       Instance:       $($db.properties.parentName)" -ForegroundColor Gray
-        Write-Host "       State:          $state" -ForegroundColor Gray
-        Write-Host "       Policy:         $policy" -ForegroundColor Gray
-        Write-Host "       Last Backup:    $lastBackup" -ForegroundColor Gray
+    # Filter by -InstanceName if provided
+    if (-not [string]::IsNullOrWhiteSpace($InstanceName)) {
+        $filteredDBs = @($vmProtectedDBs | Where-Object { $_.properties.parentName -ieq $InstanceName })
+        if ($filteredDBs.Count -eq 0) {
+            Write-Host "  WARNING: No protected databases found for instance '$InstanceName'." -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "  Available instances with protected databases:" -ForegroundColor Yellow
+            $instGroups = $vmProtectedDBs | Group-Object { $_.properties.parentName }
+            foreach ($g in $instGroups) {
+                Write-Host "    - $($g.Name) ($($g.Count) database(s))" -ForegroundColor White
+            }
+            Write-Host ""
+            exit 1
+        }
+        Write-Host "  Filtered to instance '$InstanceName': $($filteredDBs.Count) database(s)" -ForegroundColor Cyan
+        $vmProtectedDBs = $filteredDBs
         Write-Host ""
-        $dbIdx++
+    }
+    
+    # Display protected databases grouped by instance if multiple instances
+    $instanceGroupsDisplay = $vmProtectedDBs | Group-Object { $_.properties.parentName }
+    if ($instanceGroupsDisplay.Count -gt 1) {
+        $globalIdx = 1
+        foreach ($group in $instanceGroupsDisplay) {
+            Write-Host "  [$($group.Name)]" -ForegroundColor Yellow
+            foreach ($db in $group.Group) {
+                $state = $db.properties.protectionState
+                $policy = $db.properties.policyName
+                $lastBackup = $db.properties.lastBackupTime
+                
+                Write-Host "    [$globalIdx] $($db.properties.friendlyName)" -ForegroundColor White
+                Write-Host "         State:          $state" -ForegroundColor Gray
+                Write-Host "         Policy:         $policy" -ForegroundColor Gray
+                Write-Host "         Last Backup:    $lastBackup" -ForegroundColor Gray
+                Write-Host ""
+                $globalIdx++
+            }
+        }
+    } else {
+        $dbIdx = 1
+        foreach ($db in $vmProtectedDBs) {
+            $state = $db.properties.protectionState
+            $policy = $db.properties.policyName
+            $lastBackup = $db.properties.lastBackupTime
+            
+            Write-Host "  [$dbIdx] $($db.properties.friendlyName)" -ForegroundColor White
+            Write-Host "       Instance:       $($db.properties.parentName)" -ForegroundColor Gray
+            Write-Host "       State:          $state" -ForegroundColor Gray
+            Write-Host "       Policy:         $policy" -ForegroundColor Gray
+            Write-Host "       Last Backup:    $lastBackup" -ForegroundColor Gray
+            Write-Host ""
+            $dbIdx++
+        }
     }
     
     # Select the database
     if (-not [string]::IsNullOrWhiteSpace($DatabaseName)) {
-        $selectedDB = $vmProtectedDBs | Where-Object {
-            $_.properties.friendlyName -eq $DatabaseName -or
-            $_.properties.friendlyName -ieq $DatabaseName
+        if (-not [string]::IsNullOrWhiteSpace($InstanceName)) {
+            # Filter by both DatabaseName and InstanceName
+            $selectedDB = $vmProtectedDBs | Where-Object {
+                $_.properties.friendlyName -ieq $DatabaseName -and $_.properties.parentName -ieq $InstanceName
+            }
+        } else {
+            $selectedDB = $vmProtectedDBs | Where-Object {
+                $_.properties.friendlyName -eq $DatabaseName -or
+                $_.properties.friendlyName -ieq $DatabaseName
+            }
+            
+            # If multiple matches (same DB name in different instances), warn and prompt
+            if ($selectedDB -is [array] -and $selectedDB.Count -gt 1) {
+                Write-Host "  WARNING: Database '$DatabaseName' exists in multiple instances:" -ForegroundColor Yellow
+                $mIdx = 1
+                foreach ($mdb in $selectedDB) {
+                    Write-Host "    [$mIdx] $($mdb.properties.friendlyName) (Instance: $($mdb.properties.parentName))" -ForegroundColor White
+                    $mIdx++
+                }
+                Write-Host ""
+                Write-Host "  TIP: Use -InstanceName to target a specific instance." -ForegroundColor Cyan
+                $mChoice = Read-Host '  Select instance (default: 1)'
+                if ([string]::IsNullOrWhiteSpace($mChoice)) { $mChoice = "1" }
+                $mSelectedIdx = [int]$mChoice - 1
+                if ($mSelectedIdx -ge 0 -and $mSelectedIdx -lt $selectedDB.Count) {
+                    $selectedDB = $selectedDB[$mSelectedIdx]
+                } else {
+                    $selectedDB = $selectedDB[0]
+                }
+            }
         }
         
         if (-not $selectedDB) {

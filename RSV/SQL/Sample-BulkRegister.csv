@@ -1,0 +1,6 @@
+VaultSubscriptionId,VaultResourceGroup,VaultName,VMResourceGroup,VMName,InstanceName,DatabaseName,PolicyName,EnableAutoProtection,AutoProtectAllInstances
+af95aa3c-30fd-41c6-a938-4b3676fc36fb,AzureBackupRG_kajai2025,kajai-test4,AzureBackupRG_kajai2025,DEEPU-ECY,,,HourlyLogBackup,,true
+af95aa3c-30fd-41c6-a938-4b3676fc36fb,AzureBackupRG_kajai2025,kajai-test4,rg-prod-sql,SQL-PROD-01,,,HourlyLogBackup,,true
+af95aa3c-30fd-41c6-a938-4b3676fc36fb,AzureBackupRG_kajai2025,kajai-test4,rg-prod-sql,SQL-PROD-02,MSSQLSERVER,,,true,
+af95aa3c-30fd-41c6-a938-4b3676fc36fb,AzureBackupRG_kajai2025,kajai-test4,rg-dev-sql,SQL-DEV-01,,SalesDB,DailyFullBackup,,
+af95aa3c-30fd-41c6-a938-4b3676fc36fb,AzureBackupRG_kajai2025,kajai-test4,rg-dev-sql,SQL-DEV-02,SQLEXPRESS,ReportsDB,HourlyLogBackup,,

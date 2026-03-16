@@ -26,7 +26,7 @@ TWO OPERATIONAL MODES
     - Unregisters the VM container from the vault
     - Recovery points are preserved in the vault
     - All databases on the VM are processed (cannot target individual DBs)
-    - -DatabaseName is ignored; -StopAll is implied
+    - -DatabaseName and -InstanceName are ignored; -StopAll is implied
 
 
 WORKFLOW (with -Unregister)
@@ -46,9 +46,12 @@ WORKFLOW (with -Unregister)
 WORKFLOW (without -Unregister)
 -------------------------------
   1. Lists all protected SQL databases on the VM.
+     - Groups databases by instance when multiple SQL instances exist.
+     - Filters to -InstanceName if provided.
   2. Stops protection with retain data for selected database(s):
      - Specific DB if -DatabaseName provided
-     - All DBs if -StopAll specified
+       (filtered by -InstanceName if also provided)
+     - All DBs (or all in selected instance) if -StopAll specified
      - Interactive selection if neither specified (numbered list with [A] for All)
   3. If all DBs are now stopped, prompts: "Unregister VM? [Y/N, default: N]"
      - If Y: re-runs the script with -Unregister flag
@@ -111,19 +114,56 @@ PARAMETERS
   -VaultName              [Required]  Name of the Recovery Services Vault.
   -VMResourceGroup        [Required]  Resource group of the SQL Server VM.
   -VMName                 [Required]  Name of the Azure VM hosting SQL Server.
+  -InstanceName           [Optional]  SQL instance name (e.g. MSSQLSERVER,
+                                      SQLEXPRESS). Filters databases to only
+                                      those in this instance.
+                                      Ignored when -Unregister is specified.
   -DatabaseName           [Optional]  Specific DB to stop protection for.
                                       Ignored when -Unregister is specified.
-  -Unregister             [Optional]  Stop all DBs + unregister the VM container.
-                                      Processes ALL DBs, -DatabaseName is ignored.
+  -Unregister             [Optional]  Stop all DBs + unregister the VM
+                                      container. Processes ALL instances/DBs.
+                                      -InstanceName and -DatabaseName ignored.
   -StopAll                [Optional]  Stop protection for ALL DBs without
-                                      prompting. Implied when -Unregister is used.
+                                      prompting. Respects -InstanceName filter.
+                                      Implied when -Unregister is used.
   -SkipConfirmation       [Optional]  Skip all confirmation prompts (Y/N).
                                       Use for automation/scripting.
+  -Token                  [Optional]  Pre-fetched bearer token. When provided,
+                                      skips authentication. Used by the bulk
+                                      wrapper script to avoid re-authenticating
+                                      per VM. Not needed for standalone use.
 
 
 API VERSION
 -----------
   - 2025-08-01   All operations (list items, stop protection, unregister)
+
+
+SCENARIOS
+---------
+
+  1. Stop Protection - Specific Database
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  Params                                          Interactive?
+  ------                                          ------------
+  -DatabaseName "X"                               NO (prompts if ambiguous)
+  -DatabaseName "X" -InstanceName "I"             NO - exact match
+  -DatabaseName "X" (exists in 2+ instances)      Prompts to pick instance
+
+  2. Stop Protection - All Databases
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  Params                                          Interactive?
+  ------                                          ------------
+  -StopAll                                        NO - stops all DBs
+  -StopAll -InstanceName "I"                      NO - stops all DBs in instance I
+  (no params)                                     Yes - interactive selection
+
+  3. Unregister
+  ~~~~~~~~~~~~~~
+  Params                                          Interactive?
+  ------                                          ------------
+  -Unregister                                     Prompts for confirmation (x2)
+  -Unregister -SkipConfirmation                   NO - fully unattended
 
 
 PROTECTION STATES
@@ -163,7 +203,36 @@ Example 1 - Stop protection for a specific database (retain data)
         -DatabaseName "SalesDB"
 
 
-Example 2 - Stop ALL databases + unregister the VM (with confirmations)
+Example 2 - Stop protection for a database in a specific instance
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  PS> .\Unregister-SQLIaaSVM-FromVault.ps1 `
+        -VaultSubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
+        -VaultResourceGroup "rg-vault" `
+        -VaultName "myVault" `
+        -VMResourceGroup "rg-sql" `
+        -VMName "sql-vm-01" `
+        -InstanceName "SQLEXPRESS" `
+        -DatabaseName "SalesDB"
+
+  Targets SalesDB specifically in the SQLEXPRESS instance.
+
+
+Example 3 - Stop ALL databases in a specific instance
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  PS> .\Unregister-SQLIaaSVM-FromVault.ps1 `
+        -VaultSubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
+        -VaultResourceGroup "rg-vault" `
+        -VaultName "myVault" `
+        -VMResourceGroup "rg-sql" `
+        -VMName "sql-vm-01" `
+        -StopAll `
+        -InstanceName "MSSQLSERVER"
+
+  Stops protection for all DBs under MSSQLSERVER only.
+  Databases under other instances are not affected.
+
+
+Example 4 - Stop ALL databases + unregister the VM (with confirmations)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   PS> .\Unregister-SQLIaaSVM-FromVault.ps1 `
         -VaultSubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
@@ -176,9 +245,10 @@ Example 2 - Stop ALL databases + unregister the VM (with confirmations)
   You will be prompted twice:
     1. "Proceed with stop protection? [Y/N, default: Y]"
     2. "Proceed with unregistration? [Y/N, default: Y]"
+  -InstanceName is ignored; ALL instances/DBs are processed.
 
 
-Example 3 - Stop ALL + unregister (no prompts, for automation)
+Example 5 - Stop ALL + unregister (no prompts, for automation)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   PS> .\Unregister-SQLIaaSVM-FromVault.ps1 `
         -VaultSubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
@@ -189,18 +259,7 @@ Example 3 - Stop ALL + unregister (no prompts, for automation)
         -Unregister -SkipConfirmation
 
 
-Example 4 - Stop ALL databases without unregistering
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  PS> .\Unregister-SQLIaaSVM-FromVault.ps1 `
-        -VaultSubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
-        -VaultResourceGroup "rg-vault" `
-        -VaultName "myVault" `
-        -VMResourceGroup "rg-sql" `
-        -VMName "sql-vm-01" `
-        -StopAll
-
-
-Example 5 - Interactive mode (lists DBs, prompts for selection)
+Example 6 - Interactive mode (lists DBs, prompts for selection)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   PS> .\Unregister-SQLIaaSVM-FromVault.ps1 `
         -VaultSubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
@@ -209,14 +268,13 @@ Example 5 - Interactive mode (lists DBs, prompts for selection)
         -VMResourceGroup "rg-sql" `
         -VMName "sql-vm-01"
 
-  Shows a numbered list:
-    Select database(s) to stop protection:
-      [A] All databases - 3 active
+  Shows a numbered list (grouped by instance if multiple exist):
+    [MSSQLSERVER]
       [1] master (State: Protected)
       [2] SalesDB (State: Protected)
-      [3] msdb (State: Protected)
 
-    Enter number or 'A' for all (default: A):
+    [SQLEXPRESS]
+      [3] ReportsDB (State: Protected)
 
   After stopping, prompts: "Unregister VM? [Y/N, default: N]"
 
@@ -227,6 +285,9 @@ SMART BEHAVIORS
   - All DBs stopped:      Prompts to unregister (interactive mode).
   - No protected DBs:     Prompts to unregister (VM may be registered
                           but all DBs already unprotected).
+  - Multiple instances:   Groups databases by instance in the display.
+  - -DatabaseName in 2+ instances: Prompts to pick, suggests -InstanceName.
+  - -InstanceName not found: Lists available instances, exits with error.
   - 30-second wait:       Waits after stop operations before unregistering
                           to allow API propagation.
   - Container name:       Extracted from protected items API response.
@@ -245,7 +306,7 @@ OUTPUT
 Color-coded console output:
   - Cyan:    Section headers, prompts, progress
   - Magenta: Important warnings about what will happen
-  - Yellow:  Warnings, skipped items (already stopped)
+  - Yellow:  Warnings, skipped items (already stopped), instance headers
   - Green:   Success confirmations
   - Gray:    Detail values (IDs, names, status)
   - Red:     Errors
@@ -271,7 +332,8 @@ Common issues:
 
   - SecureString token:
       Newer Az.Accounts modules return SecureString tokens.
-      The script handles both formats automatically.
+      The script handles both formats automatically
+      (uses NetworkCredential method for cross-platform).
 
 
 SAFETY GUARANTEES

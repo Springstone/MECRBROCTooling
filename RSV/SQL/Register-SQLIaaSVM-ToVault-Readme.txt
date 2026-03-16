@@ -17,10 +17,12 @@ WORKFLOW
   3. Registers the VM as a VMAppContainer (skips if already registered).
   4. Inquires SQL workloads inside the VM (discovers instances and databases).
   5. Lists protectable SQL databases and instances.
+     - Groups databases by instance when multiple SQL instances exist.
+     - Filters to -InstanceName if provided.
   6. Checks if the target database is already protected.
   7. Lists available AzureWorkload backup policies.
   8. Enables protection on the selected database OR enables auto-protection
-     on the SQL instance (all current and future databases).
+     on one or all SQL instances.
   9. Verifies the final protection status.
 
 
@@ -59,23 +61,64 @@ REQUIRED PERMISSIONS (RBAC)
 
 PARAMETERS
 ----------
-  -VaultSubscriptionId    [Required]  Subscription ID of the vault.
-  -VaultResourceGroup     [Required]  Resource group of the vault.
-  -VaultName              [Required]  Name of the Recovery Services Vault.
-  -VMResourceGroup        [Required]  Resource group of the SQL Server VM.
-  -VMName                 [Required]  Name of the Azure VM hosting SQL Server.
-  -DatabaseName           [Optional]  SQL database name to protect.
-                                      If omitted, discovered DBs are listed
-                                      for interactive selection.
-  -PolicyName             [Optional]  Backup policy name. If omitted, available
-                                      policies are listed for selection.
-  -EnableAutoProtection   [Optional]  Switch to enable auto-protection on the
-                                      SQL instance instead of a single DB.
+  -VaultSubscriptionId      [Required]  Subscription ID of the vault.
+  -VaultResourceGroup       [Required]  Resource group of the vault.
+  -VaultName                [Required]  Name of the Recovery Services Vault.
+  -VMResourceGroup          [Required]  Resource group of the SQL Server VM.
+  -VMName                   [Required]  Name of the Azure VM hosting SQL Server.
+  -InstanceName             [Optional]  SQL instance name (e.g. MSSQLSERVER,
+                                        SQLEXPRESS). Filters databases and
+                                        instances to this instance only.
+                                        Disambiguates when same DB name exists
+                                        in multiple instances.
+  -DatabaseName             [Optional]  SQL database name to protect.
+                                        If omitted, discovered DBs are listed
+                                        for interactive selection.
+  -PolicyName               [Optional]  Backup policy name. If omitted,
+                                        available policies are listed.
+  -EnableAutoProtection     [Optional]  Enable auto-protection on a SQL
+                                        instance instead of a single DB.
+  -AutoProtectAllInstances  [Optional]  Auto-protect ALL SQL instances on the
+                                        VM. Implies -EnableAutoProtection.
+                                        Fully non-interactive with -PolicyName.
+  -Token                    [Optional]  Pre-fetched bearer token. When provided,
+                                        skips authentication. Used by the bulk
+                                        wrapper script to avoid re-authenticating
+                                        per VM. Not needed for standalone use.
 
 
 API VERSION
 -----------
   - 2025-08-01   All operations (discovery, registration, protection, policies)
+
+
+SCENARIOS
+---------
+
+  1. Individual Database Protection
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  Params                                          Interactive?
+  ------                                          ------------
+  (mandatory only)                                Yes - prompts for DB + policy
+  -DatabaseName "X"                               Prompts for policy
+  -DatabaseName "X" -PolicyName "P"               NO - fully unattended
+  -DatabaseName "X" -InstanceName "I" -Policy "P" NO - exact DB in exact instance
+
+  2. Auto-Protection (Single Instance)
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  Params                                          Interactive?
+  ------                                          ------------
+  -EnableAutoProtection                           Prompts for policy + instance
+  -EnableAutoProtection -PolicyName "P"           Prompts for instance if >1
+  -EnableAutoProtection -InstanceName "I" -Pol "P"  NO - targets specific instance
+
+  3. Auto-Protection (All Instances)
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  Params                                          Interactive?
+  ------                                          ------------
+  -AutoProtectAllInstances -PolicyName "P"        NO - loops through ALL instances
+
+  Note: -AutoProtectAllInstances implies -EnableAutoProtection automatically.
 
 
 EXAMPLES
@@ -96,8 +139,8 @@ Example 1 - Protect a single database (interactive policy selection)
   protection with the chosen policy.
 
 
-Example 2 - Protect a single database with a specific policy
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Example 2 - Protect a single database with a specific policy (non-interactive)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   PS> .\Register-SQLIaaSVM-ToVault.ps1 `
         -VaultSubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
         -VaultResourceGroup "rg-vault" `
@@ -110,8 +153,24 @@ Example 2 - Protect a single database with a specific policy
   Fully non-interactive. Policy is verified via API before use.
 
 
-Example 3 - Enable auto-protection on the SQL instance
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Example 3 - Protect a database in a specific instance (multi-instance VM)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  PS> .\Register-SQLIaaSVM-ToVault.ps1 `
+        -VaultSubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
+        -VaultResourceGroup "rg-vault" `
+        -VaultName "myVault" `
+        -VMResourceGroup "rg-sql" `
+        -VMName "sql-vm-01" `
+        -InstanceName "SQLEXPRESS" `
+        -DatabaseName "SalesDB" `
+        -PolicyName "HourlyLogBackup"
+
+  Targets SalesDB specifically in the SQLEXPRESS instance. If the same DB
+  name exists in MSSQLSERVER, it will not be matched.
+
+
+Example 4 - Enable auto-protection on a specific instance
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   PS> .\Register-SQLIaaSVM-ToVault.ps1 `
         -VaultSubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
         -VaultResourceGroup "rg-vault" `
@@ -119,13 +178,29 @@ Example 3 - Enable auto-protection on the SQL instance
         -VMResourceGroup "rg-sql" `
         -VMName "sql-vm-01" `
         -EnableAutoProtection `
+        -InstanceName "MSSQLSERVER" `
         -PolicyName "HourlyLogBackup"
 
-  All current and future databases under the SQL instance will be
-  automatically protected. -DatabaseName is ignored.
+  Fully non-interactive. Targets the MSSQLSERVER instance.
 
 
-Example 4 - Interactive mode (no DatabaseName, no PolicyName)
+Example 5 - Auto-protect ALL instances on the VM
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  PS> .\Register-SQLIaaSVM-ToVault.ps1 `
+        -VaultSubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
+        -VaultResourceGroup "rg-vault" `
+        -VaultName "myVault" `
+        -VMResourceGroup "rg-sql" `
+        -VMName "sql-vm-01" `
+        -AutoProtectAllInstances `
+        -PolicyName "HourlyLogBackup"
+
+  Loops through every SQL instance on the VM and enables auto-protection
+  on each. Shows per-instance success/failure and a final summary.
+  No -EnableAutoProtection needed (implied).
+
+
+Example 6 - Interactive mode (no DatabaseName, no PolicyName)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   PS> .\Register-SQLIaaSVM-ToVault.ps1 `
         -VaultSubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
@@ -134,26 +209,23 @@ Example 4 - Interactive mode (no DatabaseName, no PolicyName)
         -VMResourceGroup "rg-sql" `
         -VMName "sql-vm-01"
 
-  After discovery, the script lists all SQL databases and prompts you
-  to pick one. Then lists policies and prompts for selection.
-
-
-Example 5 - VM already protected
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  If the target database is already protected, the script displays the
-  existing protection details (policy, last backup time, health status)
-  and exits without making changes.
+  After discovery, the script lists all SQL databases (grouped by instance
+  if multiple instances exist) and prompts to pick one or choose [A] for
+  auto-protection. Then lists policies and prompts for selection.
 
 
 SMART BEHAVIORS
 ---------------
   - VM already registered:    Skips registration, continues with inquiry.
   - Database already protected: Shows existing protection details, exits.
-  - Multiple SQL instances:   Prompts user to select one (auto-protection).
+  - Multiple SQL instances:   Groups databases by instance in the display.
+  - -DatabaseName in 2+ instances: Prompts to pick, suggests -InstanceName.
+  - -InstanceName not found:  Lists available instances, exits with error.
   - Single SQL instance:      Auto-selects it without prompting.
   - PolicyName not found:     Exits with clear error (verified via API).
   - Case-insensitive DB match: Falls back to case-insensitive search.
   - Container name from API:  Uses discovered name, not manually constructed.
+  - AutoProtectAllInstances:  Continues if some instances fail; shows summary.
 
 
 OUTPUT
@@ -171,6 +243,9 @@ On success, a final summary shows:
   - Last Backup Status/Time, Policy Name
   - Workload Type, Container Name
 
+For auto-protection of multiple instances, a summary shows:
+  - Total Instances, Succeeded, Failed
+
 
 ERROR HANDLING
 --------------
@@ -178,11 +253,14 @@ Common issues:
   - 401 Unauthorized:     Wrong subscription/tenant. Run Connect-AzAccount
                           with the correct -Subscription and -Tenant.
   - SecureString token:   Newer Az.Accounts modules return SecureString tokens.
-                          The script handles both formats automatically.
+                          The script handles both formats automatically
+                          (uses NetworkCredential method for cross-platform).
   - VM not found:         Lists available VMs and suggests causes.
   - DB not found:         Lists available databases with instance names.
+  - Instance not found:   Lists available instances, exits with error.
   - Registration fails:   Suggests SQL IaaS Agent extension, VM state, RBAC.
   - Policy not found:     Clear error with 404 detection.
+  - Auto-protection 400:  Verify policy supports AzureWorkload type.
 
 
 PUBLIC DOCUMENTATION
