@@ -46,6 +46,13 @@
 .PARAMETER VMName
     The name of the Azure VM hosting SQL Server.
 
+.PARAMETER InstanceName
+    The name of the SQL instance (e.g. MSSQLSERVER, SQLEXPRESS).
+    When specified, filters databases and instances to only those belonging
+    to this instance. Useful when a VM has multiple SQL instances and you
+    want to target a specific one. Also used with -EnableAutoProtection to
+    select the instance without prompting.
+
 .PARAMETER DatabaseName
     The name of the SQL database to protect.
     Required when EnableAutoProtection is not specified.
@@ -59,6 +66,11 @@
     When specified, enables auto-protection on the SQL instance instead of 
     protecting an individual database. All current and future databases 
     under the instance will be automatically protected.
+
+.PARAMETER AutoProtectAllInstances
+    When specified together with -EnableAutoProtection, automatically iterates
+    through ALL SQL instances on the VM and enables auto-protection on each.
+    No user interaction is required (fully unattended).
 
 .EXAMPLE
     # Protect a single database (interactive policy selection)
@@ -76,6 +88,12 @@
     .\Register-SQLIaaSVM-ToVault.ps1 -VaultSubscriptionId "xxxx" -VaultResourceGroup "rg-vault" `
         -VaultName "myVault" -VMResourceGroup "rg-sql" -VMName "sql-vm-01" `
         -EnableAutoProtection -PolicyName "HourlyLogBackup"
+
+.EXAMPLE
+    # Auto-protect ALL SQL instances on the VM (fully non-interactive)
+    .\Register-SQLIaaSVM-ToVault.ps1 -VaultSubscriptionId "xxxx" -VaultResourceGroup "rg-vault" `
+        -VaultName "myVault" -VMResourceGroup "rg-sql" -VMName "sql-vm-01" `
+        -EnableAutoProtection -AutoProtectAllInstances -PolicyName "HourlyLogBackup"
 
 .EXAMPLE
     # Run without parameters - PowerShell will prompt for all mandatory inputs
@@ -111,6 +129,9 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$VMName,
 
+    [Parameter(Mandatory = $false, HelpMessage = "Name of the SQL instance to target (e.g. MSSQLSERVER). Filters databases to this instance.")]
+    [string]$InstanceName,
+
     [Parameter(Mandatory = $false, HelpMessage = "Name of the SQL database to protect. Required unless -EnableAutoProtection is specified.")]
     [string]$DatabaseName,
 
@@ -118,7 +139,13 @@ param(
     [string]$PolicyName,
 
     [Parameter(Mandatory = $false, HelpMessage = "Enable auto-protection on the SQL instance (protects all current and future databases).")]
-    [switch]$EnableAutoProtection
+    [switch]$EnableAutoProtection,
+
+    [Parameter(Mandatory = $false, HelpMessage = "When used with -EnableAutoProtection, auto-protects ALL SQL instances on the VM without prompting.")]
+    [switch]$AutoProtectAllInstances,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Pre-fetched bearer token. When provided, skips authentication. Used by bulk wrapper scripts.")]
+    [string]$Token
 )
 
 # ============================================================================
@@ -213,8 +240,9 @@ $vaultName           = $VaultName
 $vmSubscriptionId    = $VaultSubscriptionId  # VM is assumed to be in the same subscription as the vault
 $vmResourceGroup     = $VMResourceGroup
 $vmName              = $VMName
+$instanceName        = $InstanceName
 $dbName              = $DatabaseName
-$enableAutoProtection = $EnableAutoProtection.IsPresent
+$enableAutoProtection = $EnableAutoProtection.IsPresent -or $AutoProtectAllInstances.IsPresent
 
 # Construct VM Resource ID
 $vmResourceId = "/subscriptions/$vmSubscriptionId/resourceGroups/$vmResourceGroup/providers/Microsoft.Compute/virtualMachines/$vmName"
@@ -236,6 +264,11 @@ Write-Host "  Vault Name:          $vaultName" -ForegroundColor Gray
 Write-Host "  VM Resource Group:   $vmResourceGroup" -ForegroundColor Gray
 Write-Host "  VM Name:             $vmName" -ForegroundColor Gray
 Write-Host "  VM Resource ID:      $vmResourceId" -ForegroundColor Gray
+if (-not [string]::IsNullOrWhiteSpace($instanceName)) {
+    Write-Host "  Instance Name:       $instanceName" -ForegroundColor Gray
+} else {
+    Write-Host "  Instance Name:       (all instances)" -ForegroundColor Gray
+}
 if ($enableAutoProtection) {
     Write-Host "  Protection Mode:     Auto-Protection (all current + future DBs)" -ForegroundColor Green
 } else {
@@ -263,17 +296,28 @@ Write-Host "Authenticating to Azure..." -ForegroundColor Cyan
 $token = $null
 $authMethod = $null
 
+# Use pre-fetched token if provided (e.g. from bulk wrapper)
+if (-not [string]::IsNullOrWhiteSpace($Token)) {
+    $token = $Token
+    $authMethod = "Pre-fetched Token"
+    Write-Host "  Using pre-fetched token (passed via -Token parameter)" -ForegroundColor Green
+} else {
 # Try Azure PowerShell first
 try {
     $tokenResponse = Get-AzAccessToken -ResourceUrl "https://management.azure.com"
     
     # Handle both old (plain string) and new (SecureString) Az.Accounts module versions
     if ($tokenResponse.Token -is [System.Security.SecureString]) {
-        $token = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
-            [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($tokenResponse.Token)
-        )
+        # Use NetworkCredential trick - works reliably on both Windows and Linux
+        $token = [System.Net.NetworkCredential]::new('', $tokenResponse.Token).Password
     } else {
         $token = $tokenResponse.Token
+    }
+    
+    # Validate token looks like a JWT (starts with eyJ)
+    if (-not $token.StartsWith("eyJ")) {
+        Write-Host "  WARNING: Token does not appear to be a valid JWT. Trying Azure CLI fallback..." -ForegroundColor Yellow
+        throw "Invalid token format"
     }
     
     $authMethod = "Azure PowerShell"
@@ -305,6 +349,7 @@ try {
         exit 1
     }
 }
+} # end else (no pre-fetched token)
 
 # Create common headers
 $headers = @{
@@ -647,6 +692,28 @@ try {
         Write-Host "  Found $($sqlDatabases.Count) SQL database(s) and $($sqlInstances.Count) SQL instance(s) on VM '$vmName'" -ForegroundColor Green
         Write-Host ""
         
+        # Filter by -InstanceName if provided
+        if (-not [string]::IsNullOrWhiteSpace($instanceName)) {
+            $filteredDatabases = @($sqlDatabases | Where-Object { $_.properties.parentName -ieq $instanceName })
+            $filteredInstances = @($sqlInstances | Where-Object { $_.properties.friendlyName -ieq $instanceName })
+            
+            if ($filteredDatabases.Count -eq 0 -and $filteredInstances.Count -eq 0) {
+                Write-Host "  WARNING: Instance '$instanceName' not found on VM '$vmName'." -ForegroundColor Yellow
+                Write-Host ""
+                Write-Host "  Available instances:" -ForegroundColor Yellow
+                foreach ($inst in $sqlInstances) {
+                    Write-Host "    - $($inst.properties.friendlyName)" -ForegroundColor White
+                }
+                Write-Host ""
+                exit 1
+            }
+            
+            Write-Host "  Filtered to instance '$instanceName': $($filteredDatabases.Count) database(s)" -ForegroundColor Cyan
+            $sqlDatabases = $filteredDatabases
+            $sqlInstances = $filteredInstances
+            Write-Host ""
+        }
+        
         # Show SQL instances
         if ($sqlInstances.Count -gt 0) {
             Write-Host "  SQL Instances:" -ForegroundColor Cyan
@@ -657,13 +724,26 @@ try {
             Write-Host ""
         }
         
-        # Show SQL databases
+        # Show SQL databases grouped by instance
         if ($sqlDatabases.Count -gt 0) {
-            Write-Host "  SQL Databases:" -ForegroundColor Cyan
-            foreach ($db in $sqlDatabases) {
-                $state = $db.properties.protectionState
-                if (-not $state) { $state = "NotProtected" }
-                Write-Host "    - $($db.properties.friendlyName) (Instance: $($db.properties.parentName), State: $state)" -ForegroundColor White
+            $instanceGroups = $sqlDatabases | Group-Object { $_.properties.parentName }
+            if ($instanceGroups.Count -gt 1) {
+                Write-Host "  SQL Databases (grouped by instance):" -ForegroundColor Cyan
+                foreach ($group in $instanceGroups) {
+                    Write-Host "    [$($group.Name)]" -ForegroundColor Yellow
+                    foreach ($db in $group.Group) {
+                        $state = $db.properties.protectionState
+                        if (-not $state) { $state = "NotProtected" }
+                        Write-Host "      - $($db.properties.friendlyName) (State: $state)" -ForegroundColor White
+                    }
+                }
+            } else {
+                Write-Host "  SQL Databases:" -ForegroundColor Cyan
+                foreach ($db in $sqlDatabases) {
+                    $state = $db.properties.protectionState
+                    if (-not $state) { $state = "NotProtected" }
+                    Write-Host "    - $($db.properties.friendlyName) (Instance: $($db.properties.parentName), State: $state)" -ForegroundColor White
+                }
             }
             Write-Host ""
         }
@@ -725,14 +805,41 @@ try {
                 }
             } else {
                 # DatabaseName was provided - find it in the list
-                $matchingDB = $sqlDatabases | Where-Object {
-                    $_.properties.friendlyName -eq $dbName
-                }
-                
-                if (-not $matchingDB) {
-                    # Try case-insensitive match
+                # If InstanceName is also provided, filter by both
+                if (-not [string]::IsNullOrWhiteSpace($instanceName)) {
                     $matchingDB = $sqlDatabases | Where-Object {
-                        $_.properties.friendlyName -ieq $dbName
+                        $_.properties.friendlyName -ieq $dbName -and $_.properties.parentName -ieq $instanceName
+                    }
+                } else {
+                    $matchingDB = $sqlDatabases | Where-Object {
+                        $_.properties.friendlyName -eq $dbName
+                    }
+                    
+                    if (-not $matchingDB) {
+                        # Try case-insensitive match
+                        $matchingDB = $sqlDatabases | Where-Object {
+                            $_.properties.friendlyName -ieq $dbName
+                        }
+                    }
+                    
+                    # If multiple matches (same DB name in different instances), warn and prompt
+                    if ($matchingDB -is [array] -and $matchingDB.Count -gt 1) {
+                        Write-Host "  WARNING: Database '$dbName' exists in multiple instances:" -ForegroundColor Yellow
+                        $mIdx = 1
+                        foreach ($mdb in $matchingDB) {
+                            Write-Host "    [$mIdx] $($mdb.properties.friendlyName) (Instance: $($mdb.properties.parentName))" -ForegroundColor White
+                            $mIdx++
+                        }
+                        Write-Host ""
+                        Write-Host "  TIP: Use -InstanceName to target a specific instance." -ForegroundColor Cyan
+                        $mChoice = Read-Host '  Select instance (default: 1)'
+                        if ([string]::IsNullOrWhiteSpace($mChoice)) { $mChoice = "1" }
+                        $mSelectedIdx = [int]$mChoice - 1
+                        if ($mSelectedIdx -ge 0 -and $mSelectedIdx -lt $matchingDB.Count) {
+                            $matchingDB = $matchingDB[$mSelectedIdx]
+                        } else {
+                            $matchingDB = $matchingDB[0]
+                        }
                     }
                 }
                 
@@ -763,11 +870,46 @@ try {
             }
         }
         
-        # Find the SQL instance for auto-protection
+        # Find the SQL instance(s) for auto-protection
         if ($enableAutoProtection) {
             if ($sqlInstances.Count -gt 0) {
-                if ($sqlInstances.Count -eq 1) {
+                # If -InstanceName was provided (and not -AutoProtectAllInstances), use it to select the instance
+                if (-not [string]::IsNullOrWhiteSpace($instanceName) -and -not $AutoProtectAllInstances.IsPresent) {
+                    $matchingInstance = $sqlInstances | Where-Object { $_.properties.friendlyName -ieq $instanceName }
+                    if ($matchingInstance) {
+                        if ($matchingInstance -is [array]) { $matchingInstance = $matchingInstance[0] }
+                        $allInstancesToProtect = @($matchingInstance)
+                        Write-Host ""
+                        Write-Host "  Selected SQL Instance (via -InstanceName):" -ForegroundColor Green
+                        Write-Host "    Instance Name: $($matchingInstance.properties.friendlyName)" -ForegroundColor Gray
+                        Write-Host "    Server Name:   $($matchingInstance.properties.serverName)" -ForegroundColor Gray
+                        Write-Host "    Item Name:     $($matchingInstance.name)" -ForegroundColor Gray
+                    } else {
+                        Write-Host "  ERROR: Instance '$instanceName' not found on VM '$vmName'." -ForegroundColor Red
+                        Write-Host "  Available instances:" -ForegroundColor Yellow
+                        foreach ($inst in $sqlInstances) {
+                            Write-Host "    - $($inst.properties.friendlyName)" -ForegroundColor White
+                        }
+                        exit 1
+                    }
+                } elseif ($AutoProtectAllInstances.IsPresent) {
+                    # Auto-protect ALL instances - store them in an array for later iteration
+                    $allInstancesToProtect = @($sqlInstances)
+                    Write-Host ""
+                    Write-Host "  AutoProtectAllInstances: Will protect $($allInstancesToProtect.Count) SQL instance(s):" -ForegroundColor Green
+                    foreach ($inst in $allInstancesToProtect) {
+                        Write-Host "    - $($inst.properties.friendlyName) (Server: $($inst.properties.serverName))" -ForegroundColor Gray
+                    }
+                    # Set matchingInstance to first for backward compatibility (Step 8A handles the loop)
+                    $matchingInstance = $allInstancesToProtect[0]
+                } elseif ($sqlInstances.Count -eq 1) {
                     $matchingInstance = $sqlInstances[0]
+                    $allInstancesToProtect = @($matchingInstance)
+                    Write-Host ""
+                    Write-Host "  Selected SQL Instance for auto-protection:" -ForegroundColor Green
+                    Write-Host "    Instance Name: $($matchingInstance.properties.friendlyName)" -ForegroundColor Gray
+                    Write-Host "    Server Name:   $($matchingInstance.properties.serverName)" -ForegroundColor Gray
+                    Write-Host "    Item Name:     $($matchingInstance.name)" -ForegroundColor Gray
                 } else {
                     Write-Host "  Multiple SQL instances found. Select one:" -ForegroundColor Cyan
                     $idx = 1
@@ -783,13 +925,13 @@ try {
                     } else {
                         $matchingInstance = $sqlInstances[0]
                     }
+                    $allInstancesToProtect = @($matchingInstance)
+                    Write-Host ""
+                    Write-Host "  Selected SQL Instance for auto-protection:" -ForegroundColor Green
+                    Write-Host "    Instance Name: $($matchingInstance.properties.friendlyName)" -ForegroundColor Gray
+                    Write-Host "    Server Name:   $($matchingInstance.properties.serverName)" -ForegroundColor Gray
+                    Write-Host "    Item Name:     $($matchingInstance.name)" -ForegroundColor Gray
                 }
-                
-                Write-Host ""
-                Write-Host "  Selected SQL Instance for auto-protection:" -ForegroundColor Green
-                Write-Host "    Instance Name: $($matchingInstance.properties.friendlyName)" -ForegroundColor Gray
-                Write-Host "    Server Name:   $($matchingInstance.properties.serverName)" -ForegroundColor Gray
-                Write-Host "    Item Name:     $($matchingInstance.name)" -ForegroundColor Gray
             } else {
                 Write-Host "  WARNING: No SQL instances found on VM '$vmName'." -ForegroundColor Yellow
                 Write-Host "  Cannot enable auto-protection without an instance." -ForegroundColor Yellow
@@ -999,71 +1141,98 @@ if (-not $isAlreadyProtected) {
     
     if ($enableAutoProtection -and $matchingInstance) {
         Write-Host ""
-        Write-Host "STEP 8: Enabling Auto-Protection on SQL Instance" -ForegroundColor Yellow
-        Write-Host "--------------------------------------------------" -ForegroundColor Yellow
+        Write-Host "STEP 8: Enabling Auto-Protection on SQL Instance(s)" -ForegroundColor Yellow
+        Write-Host "----------------------------------------------------" -ForegroundColor Yellow
         Write-Host ""
         
-        Write-Host "Preparing auto-protection request..." -ForegroundColor Cyan
-        Write-Host "  Vault:              $vaultName" -ForegroundColor Gray
-        Write-Host "  SQL Instance:       $($matchingInstance.properties.friendlyName)" -ForegroundColor Gray
-        Write-Host "  Server:             $($matchingInstance.properties.serverName)" -ForegroundColor Gray
-        Write-Host "  Policy:             $selectedPolicyName" -ForegroundColor Gray
+        $instCount = $allInstancesToProtect.Count
+        $instCurrent = 0
+        $instSucceeded = 0
+        $instFailed = 0
+        
+        foreach ($currentInstance in $allInstancesToProtect) {
+            $instCurrent++
+            
+            Write-Host "Preparing auto-protection request ($instCurrent/$instCount)..." -ForegroundColor Cyan
+            Write-Host "  Vault:              $vaultName" -ForegroundColor Gray
+            Write-Host "  SQL Instance:       $($currentInstance.properties.friendlyName)" -ForegroundColor Gray
+            Write-Host "  Server:             $($currentInstance.properties.serverName)" -ForegroundColor Gray
+            Write-Host "  Policy:             $selectedPolicyName" -ForegroundColor Gray
+            Write-Host ""
+            
+            # The intentObjectName for auto-protection must be a random GUID
+            # (Azure CLI uses uuid4() for this - using the item name causes 400 errors)
+            $intentObjectName = [guid]::NewGuid().ToString()
+            
+            $autoProtectUri = "https://management.azure.com/subscriptions/$vaultSubscriptionId/resourceGroups/$vaultResourceGroup/providers/Microsoft.RecoveryServices/vaults/$vaultName/backupFabrics/Azure/backupProtectionIntent/$intentObjectName`?api-version=$apiVersionProtection"
+            
+            # Get the protectable item ID of the SQL instance
+            $instanceProtectableItemId = $currentInstance.id
+            
+            # The request body uses RecoveryServiceVaultItem type with only
+            # backupManagementType, policyId, and itemId (matching Azure CLI behavior)
+            $autoProtectBody = @{
+                properties = @{
+                    protectionIntentItemType = "RecoveryServiceVaultItem"
+                    backupManagementType     = "AzureWorkload"
+                    policyId                 = $selectedPolicyId
+                    itemId                   = $instanceProtectableItemId
+                }
+            } | ConvertTo-Json -Depth 10
+            
+            Write-Host "Submitting auto-protection request..." -ForegroundColor Cyan
+            
+            try {
+                $autoProtectResponse = Invoke-RestMethod -Uri $autoProtectUri -Method PUT -Headers $headers -Body $autoProtectBody
+                
+                $instSucceeded++
+                Write-Host ""
+                Write-Host "  AUTO-PROTECTION ENABLED for '$($currentInstance.properties.friendlyName)'" -ForegroundColor Green
+                
+                if ($autoProtectResponse.properties) {
+                    Write-Host "    Protection Intent Type: $($autoProtectResponse.properties.protectionIntentItemType)" -ForegroundColor White
+                    Write-Host "    Protection State:       $($autoProtectResponse.properties.protectionState)" -ForegroundColor White
+                    Write-Host "    Policy ID:              $($autoProtectResponse.properties.policyId)" -ForegroundColor White
+                    Write-Host "    Item ID:                $($autoProtectResponse.properties.itemId)" -ForegroundColor White
+                }
+                Write-Host ""
+            } catch {
+                $instFailed++
+                $statusCode = $_.Exception.Response.StatusCode.value__
+                
+                Write-Host ""
+                Write-Host "  FAILED to enable auto-protection for '$($currentInstance.properties.friendlyName)'" -ForegroundColor Red
+                Write-ApiError -ErrorRecord $_ -Context "Auto-Protection ($($currentInstance.properties.friendlyName))"
+                Write-Host ""
+                
+                # If only one instance, exit on failure; if multiple, continue with the rest
+                if ($instCount -eq 1) {
+                    Write-Host "Possible causes:" -ForegroundColor Yellow
+                    Write-Host "  1. The SQL instance is not auto-protectable" -ForegroundColor White
+                    Write-Host "  2. Insufficient permissions" -ForegroundColor White
+                    Write-Host "  3. The policy doesn't support SQL workloads" -ForegroundColor White
+                    Write-Host "  4. Another auto-protection intent already exists for this instance" -ForegroundColor White
+                    Write-Host ""
+                    exit 1
+                }
+            }
+        }
+        
+        # Summary for multi-instance auto-protection
+        Write-Host "==========================================================" -ForegroundColor Green
+        Write-Host "  AUTO-PROTECTION SUMMARY" -ForegroundColor Green
+        Write-Host "==========================================================" -ForegroundColor Green
+        Write-Host "  Total Instances:   $instCount" -ForegroundColor White
+        Write-Host "  Succeeded:         $instSucceeded" -ForegroundColor Green
+        if ($instFailed -gt 0) {
+            Write-Host "  Failed:            $instFailed" -ForegroundColor Red
+        } else {
+            Write-Host "  Failed:            0" -ForegroundColor White
+        }
         Write-Host ""
         
-        # The intentObjectName for auto-protection
-        $instanceItemName = $matchingInstance.name
-        $intentObjectName = $instanceItemName
-        
-        $autoProtectUri = "https://management.azure.com/subscriptions/$vaultSubscriptionId/resourceGroups/$vaultResourceGroup/providers/Microsoft.RecoveryServices/vaults/$vaultName/backupFabrics/Azure/backupProtectionIntent/$intentObjectName`?api-version=$apiVersionProtection"
-        
-        # Get the protectable item ID of the SQL instance
-        $instanceProtectableItemId = $matchingInstance.id
-        
-        $autoProtectBody = @{
-            properties = @{
-                protectionIntentItemType = "AzureWorkloadSQLAutoProtectionIntent"
-                backupManagementType     = "AzureWorkload"
-                policyId                 = $selectedPolicyId
-                itemId                   = $instanceProtectableItemId
-                workloadItemType         = "SQLInstance"
-            }
-        } | ConvertTo-Json -Depth 10
-        
-        Write-Host "Submitting auto-protection request..." -ForegroundColor Cyan
-        
-        try {
-            $autoProtectResponse = Invoke-RestMethod -Uri $autoProtectUri -Method PUT -Headers $headers -Body $autoProtectBody
-            
-            Write-Host ""
-            Write-Host "==========================================================" -ForegroundColor Green
-            Write-Host "  AUTO-PROTECTION ENABLED SUCCESSFULLY!" -ForegroundColor Green
-            Write-Host "==========================================================" -ForegroundColor Green
-            Write-Host ""
-            Write-Host "  All current and future SQL databases under instance" -ForegroundColor White
-            Write-Host "  '$($matchingInstance.properties.friendlyName)' will be automatically protected." -ForegroundColor White
-            Write-Host ""
-            
-            if ($autoProtectResponse.properties) {
-                Write-Host "Auto-Protection Details:" -ForegroundColor Cyan
-                Write-Host "  Protection Intent Type: $($autoProtectResponse.properties.protectionIntentItemType)" -ForegroundColor White
-                Write-Host "  Protection State:       $($autoProtectResponse.properties.protectionState)" -ForegroundColor White
-                Write-Host "  Policy ID:              $($autoProtectResponse.properties.policyId)" -ForegroundColor White
-                Write-Host "  Item ID:                $($autoProtectResponse.properties.itemId)" -ForegroundColor White
-            }
-            Write-Host ""
-        } catch {
-            $statusCode = $_.Exception.Response.StatusCode.value__
-            
-            Write-Host ""
-            Write-Host "ERROR: Failed to enable auto-protection." -ForegroundColor Red
-            Write-ApiError -ErrorRecord $_ -Context "Auto-Protection"
-            Write-Host ""
-            Write-Host "Possible causes:" -ForegroundColor Yellow
-            Write-Host "  1. The SQL instance is not auto-protectable" -ForegroundColor White
-            Write-Host "  2. Insufficient permissions" -ForegroundColor White
-            Write-Host "  3. The policy doesn't support SQL workloads" -ForegroundColor White
-            Write-Host "  4. Another auto-protection intent already exists for this instance" -ForegroundColor White
-            Write-Host ""
+        if ($instFailed -gt 0 -and $instSucceeded -eq 0) {
+            Write-Host "ERROR: All auto-protection attempts failed." -ForegroundColor Red
             exit 1
         }
     }

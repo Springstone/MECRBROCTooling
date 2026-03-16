@@ -42,6 +42,12 @@
 .PARAMETER VMName
     The name of the Azure VM hosting SQL Server.
 
+.PARAMETER InstanceName
+    The name of the SQL instance (e.g. MSSQLSERVER, SQLEXPRESS).
+    When specified, filters protected databases to only those belonging
+    to this instance. Useful when a VM has multiple SQL instances.
+    Ignored when -Unregister is specified (all instances are processed).
+
 .PARAMETER DatabaseName
     The name of a specific SQL database to stop protection for.
     Only used when -Unregister is NOT specified.
@@ -109,6 +115,9 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$VMName,
 
+    [Parameter(Mandatory = $false, HelpMessage = "Name of the SQL instance to target (e.g. MSSQLSERVER). Filters databases to this instance. Ignored when -Unregister is specified.")]
+    [string]$InstanceName,
+
     [Parameter(Mandatory = $false, HelpMessage = "Name of a specific SQL database to stop protection for. Ignored when -Unregister is specified.")]
     [string]$DatabaseName,
 
@@ -119,7 +128,10 @@ param(
     [switch]$StopAll,
 
     [Parameter(Mandatory = $false, HelpMessage = "Skip confirmation prompts. Use this for automation/scripting.")]
-    [switch]$SkipConfirmation
+    [switch]$SkipConfirmation,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Pre-fetched bearer token. When provided, skips authentication. Used by bulk wrapper scripts.")]
+    [string]$Token
 )
 
 # ============================================================================
@@ -204,7 +216,7 @@ function Write-ApiError {
 # HELPER FUNCTION: Stop protection with retain data for a single DB
 # ============================================================================
 
-function Stop-SQLDatabaseProtection {
+function Submit-StopProtectionRequest {
     param(
         [object]$ProtectedItem,
         [hashtable]$Headers,
@@ -216,11 +228,8 @@ function Stop-SQLDatabaseProtection {
 
     # Skip if already stopped
     if ($currentState -eq "ProtectionStopped") {
-        Write-Host "    SKIPPED: '$dbFriendlyName' - protection already stopped" -ForegroundColor Yellow
-        return $true
+        return @{ Name = $dbFriendlyName; Status = "Skipped"; TrackingUrl = $null }
     }
-
-    Write-Host "    Stopping protection for '$dbFriendlyName'..." -ForegroundColor Cyan
 
     # Construct the PUT URI from the protected item ID
     $itemUri = "https://management.azure.com$($ProtectedItem.id)?api-version=$ApiVersion"
@@ -240,61 +249,141 @@ function Stop-SQLDatabaseProtection {
         $statusCode = $stopResponse.StatusCode
 
         if ($statusCode -eq 200) {
-            Write-Host "    SUCCESS: Protection stopped for '$dbFriendlyName' (200 OK)" -ForegroundColor Green
-            return $true
+            return @{ Name = $dbFriendlyName; Status = "Succeeded"; TrackingUrl = $null }
         } elseif ($statusCode -eq 202) {
-            Write-Host "    Accepted (202). Tracking operation..." -ForegroundColor Green
             $asyncUrl = $stopResponse.Headers["Azure-AsyncOperation"]
             $locationUrl = $stopResponse.Headers["Location"]
             $trackingUrl = if ($asyncUrl) { $asyncUrl } else { $locationUrl }
-
-            if ($trackingUrl) {
-                $maxRetries = 20
-                $retryCount = 0
-                $completed = $false
-
-                while (-not $completed -and $retryCount -lt $maxRetries) {
-                    Start-Sleep -Seconds 8
-                    try {
-                        $opResponse = Invoke-RestMethod -Uri $trackingUrl -Method GET -Headers $Headers
-                        $opStatus = $null
-                        if ($opResponse.status) { $opStatus = $opResponse.status }
-
-                        if ($opStatus -eq "Succeeded") {
-                            $completed = $true
-                            Write-Host "    SUCCESS: Protection stopped for '$dbFriendlyName'" -ForegroundColor Green
-                        } else {
-                            $retryCount++
-                            Write-Host "    Waiting... ($retryCount/$maxRetries) [Status: $opStatus]" -ForegroundColor Yellow
-                        }
-                    } catch {
-                        $retryCount++
-                        Write-Host "    Polling... ($retryCount/$maxRetries)" -ForegroundColor Yellow
-                    }
-                }
-
-                if (-not $completed) {
-                    Write-Host "    WARNING: Operation timed out for '$dbFriendlyName'. Check Azure Portal." -ForegroundColor Yellow
-                }
-                return $completed
-            }
+            return @{ Name = $dbFriendlyName; Status = "InProgress"; TrackingUrl = $trackingUrl }
         }
     } catch {
         $statusCode = $_.Exception.Response.StatusCode.value__
 
         if ($statusCode -eq 202) {
-            Write-Host "    Accepted (202). Waiting for completion..." -ForegroundColor Green
-            Start-Sleep -Seconds 15
-            Write-Host "    Check Azure Portal to confirm." -ForegroundColor Yellow
-            return $true
+            try {
+                $asyncUrl = $_.Exception.Response.Headers["Azure-AsyncOperation"]
+                $locationUrl = $_.Exception.Response.Headers["Location"]
+                $trackingUrl = if ($asyncUrl) { $asyncUrl } else { $locationUrl }
+                return @{ Name = $dbFriendlyName; Status = "InProgress"; TrackingUrl = $trackingUrl }
+            } catch {
+                return @{ Name = $dbFriendlyName; Status = "InProgress"; TrackingUrl = $null }
+            }
         } else {
-            Write-Host "    ERROR: Failed to stop protection for '$dbFriendlyName'" -ForegroundColor Red
+            Write-Host "    ERROR: Failed to submit stop request for '$dbFriendlyName'" -ForegroundColor Red
             Write-ApiError -ErrorRecord $_ -Context "Stop Protection"
-            return $false
+            return @{ Name = $dbFriendlyName; Status = "Failed"; TrackingUrl = $null }
         }
     }
 
-    return $true
+    return @{ Name = $dbFriendlyName; Status = "Succeeded"; TrackingUrl = $null }
+}
+
+function Stop-SQLDatabasesParallel {
+    param(
+        [array]$ProtectedItems,
+        [hashtable]$Headers,
+        [string]$ApiVersion,
+        [int]$MaxPollRetries = 20,
+        [int]$PollDelaySeconds = 8
+    )
+
+    $stopSuccessCount = 0
+    $stopFailCount = 0
+    $stopSkipCount = 0
+    $pendingOps = @()
+
+    # Phase 1: Fire all stop requests without waiting
+    Write-Host "  Phase 1: Submitting stop requests for $($ProtectedItems.Count) database(s)..." -ForegroundColor Cyan
+    Write-Host ""
+
+    foreach ($db in $ProtectedItems) {
+        $currentState = $db.properties.protectionState
+        if ($currentState -eq "ProtectionStopped") {
+            Write-Host "    SKIPPED: '$($db.properties.friendlyName)' - already stopped" -ForegroundColor Yellow
+            $stopSkipCount++
+            continue
+        }
+
+        Write-Host "    Submitting stop for '$($db.properties.friendlyName)'..." -ForegroundColor Cyan
+        $result = Submit-StopProtectionRequest -ProtectedItem $db -Headers $Headers -ApiVersion $ApiVersion
+
+        if ($result.Status -eq "Succeeded") {
+            Write-Host "    SUCCESS: '$($result.Name)' stopped immediately (200 OK)" -ForegroundColor Green
+            $stopSuccessCount++
+        } elseif ($result.Status -eq "InProgress") {
+            Write-Host "    ACCEPTED: '$($result.Name)' (202) - will poll" -ForegroundColor Green
+            $pendingOps += $result
+        } elseif ($result.Status -eq "Skipped") {
+            $stopSkipCount++
+        } else {
+            $stopFailCount++
+        }
+    }
+
+    # Phase 2: Poll all pending operations together
+    if ($pendingOps.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  Phase 2: Polling $($pendingOps.Count) pending operation(s)..." -ForegroundColor Cyan
+
+        $retryCount = 0
+        while ($pendingOps.Count -gt 0 -and $retryCount -lt $MaxPollRetries) {
+            Start-Sleep -Seconds $PollDelaySeconds
+            $retryCount++
+
+            $stillPending = @()
+
+            foreach ($op in $pendingOps) {
+                if ([string]::IsNullOrWhiteSpace($op.TrackingUrl)) {
+                    # No tracking URL - assume success after wait
+                    Write-Host "    SUCCESS: '$($op.Name)' (no tracking URL, assumed complete)" -ForegroundColor Green
+                    $stopSuccessCount++
+                    continue
+                }
+
+                try {
+                    $opResponse = Invoke-RestMethod -Uri $op.TrackingUrl -Method GET -Headers $Headers
+                    $opStatus = if ($opResponse.status) { $opResponse.status } else { $null }
+
+                    if ($opStatus -eq "Succeeded") {
+                        Write-Host "    SUCCESS: '$($op.Name)' completed" -ForegroundColor Green
+                        $stopSuccessCount++
+                    } elseif ($opStatus -eq "Failed") {
+                        Write-Host "    FAILED: '$($op.Name)'" -ForegroundColor Red
+                        $stopFailCount++
+                    } else {
+                        $stillPending += $op
+                    }
+                } catch {
+                    $innerCode = $_.Exception.Response.StatusCode.value__
+                    if ($innerCode -eq 200 -or $innerCode -eq 204) {
+                        Write-Host "    SUCCESS: '$($op.Name)' completed" -ForegroundColor Green
+                        $stopSuccessCount++
+                    } else {
+                        $stillPending += $op
+                    }
+                }
+            }
+
+            $pendingOps = $stillPending
+
+            if ($pendingOps.Count -gt 0) {
+                $names = ($pendingOps | ForEach-Object { $_.Name }) -join ", "
+                Write-Host "    Waiting... ($retryCount/$MaxPollRetries) - pending: $names" -ForegroundColor Yellow
+            }
+        }
+
+        # Anything still pending after max retries
+        foreach ($op in $pendingOps) {
+            Write-Host "    WARNING: '$($op.Name)' timed out. Check Azure Portal." -ForegroundColor Yellow
+            $stopFailCount++
+        }
+    }
+
+    return @{
+        Succeeded = $stopSuccessCount
+        Failed    = $stopFailCount
+        Skipped   = $stopSkipCount
+    }
 }
 
 # ============================================================================
@@ -350,15 +439,25 @@ Write-Host "Authenticating to Azure..." -ForegroundColor Cyan
 
 $token = $null
 
+# Use pre-fetched token if provided (e.g. from bulk wrapper)
+if (-not [string]::IsNullOrWhiteSpace($Token)) {
+    $token = $Token
+    Write-Host "  Using pre-fetched token (passed via -Token parameter)" -ForegroundColor Green
+} else {
 try {
     $tokenResponse = Get-AzAccessToken -ResourceUrl "https://management.azure.com"
 
     if ($tokenResponse.Token -is [System.Security.SecureString]) {
-        $token = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
-            [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($tokenResponse.Token)
-        )
+        # Use NetworkCredential trick - works reliably on both Windows and Linux
+        $token = [System.Net.NetworkCredential]::new('', $tokenResponse.Token).Password
     } else {
         $token = $tokenResponse.Token
+    }
+
+    # Validate token looks like a JWT (starts with eyJ)
+    if (-not $token.StartsWith("eyJ")) {
+        Write-Host "  WARNING: Token does not appear to be a valid JWT. Trying Azure CLI fallback..." -ForegroundColor Yellow
+        throw "Invalid token format"
     }
 
     Write-Host "  Authentication successful (Azure PowerShell)" -ForegroundColor Green
@@ -382,6 +481,7 @@ try {
         exit 1
     }
 }
+} # end else (no pre-fetched token)
 
 $headers = @{
     "Authorization" = "Bearer $token"
@@ -449,20 +549,61 @@ try {
         Write-Host "  Container: $containerName" -ForegroundColor Gray
         Write-Host ""
 
-        $dbIdx = 1
-        foreach ($db in $vmProtectedDBs) {
-            $state = $db.properties.protectionState
-            $policy = $db.properties.policyName
-            $lastBackup = $db.properties.lastBackupTime
-            $stateColor = if ($state -eq "ProtectionStopped") { "Yellow" } else { "White" }
-
-            Write-Host "  [$dbIdx] $($db.properties.friendlyName)" -ForegroundColor $stateColor
-            Write-Host "       Instance:       $($db.properties.parentName)" -ForegroundColor Gray
-            Write-Host "       State:          $state" -ForegroundColor Gray
-            Write-Host "       Policy:         $policy" -ForegroundColor Gray
-            Write-Host "       Last Backup:    $lastBackup" -ForegroundColor Gray
+        # Filter by -InstanceName if provided (only in non-Unregister mode)
+        if (-not [string]::IsNullOrWhiteSpace($InstanceName) -and -not $Unregister) {
+            $filteredDBs = @($vmProtectedDBs | Where-Object { $_.properties.parentName -ieq $InstanceName })
+            if ($filteredDBs.Count -eq 0) {
+                Write-Host "  WARNING: No protected databases found for instance '$InstanceName'." -ForegroundColor Yellow
+                Write-Host ""
+                Write-Host "  Available instances with protected databases:" -ForegroundColor Yellow
+                $instGroups = $vmProtectedDBs | Group-Object { $_.properties.parentName }
+                foreach ($g in $instGroups) {
+                    Write-Host "    - $($g.Name) ($($g.Count) database(s))" -ForegroundColor White
+                }
+                Write-Host ""
+                exit 1
+            }
+            Write-Host "  Filtered to instance '$InstanceName': $($filteredDBs.Count) database(s)" -ForegroundColor Cyan
+            $vmProtectedDBs = $filteredDBs
             Write-Host ""
-            $dbIdx++
+        }
+
+        # Display protected databases grouped by instance
+        $instanceGroupsDisplay = $vmProtectedDBs | Group-Object { $_.properties.parentName }
+        if ($instanceGroupsDisplay.Count -gt 1) {
+            foreach ($group in $instanceGroupsDisplay) {
+                Write-Host "  [$($group.Name)]" -ForegroundColor Yellow
+                $dbIdx = 1
+                foreach ($db in $group.Group) {
+                    $state = $db.properties.protectionState
+                    $policy = $db.properties.policyName
+                    $lastBackup = $db.properties.lastBackupTime
+                    $stateColor = if ($state -eq "ProtectionStopped") { "Yellow" } else { "White" }
+
+                    Write-Host "    [$dbIdx] $($db.properties.friendlyName)" -ForegroundColor $stateColor
+                    Write-Host "         State:          $state" -ForegroundColor Gray
+                    Write-Host "         Policy:         $policy" -ForegroundColor Gray
+                    Write-Host "         Last Backup:    $lastBackup" -ForegroundColor Gray
+                    Write-Host ""
+                    $dbIdx++
+                }
+            }
+        } else {
+            $dbIdx = 1
+            foreach ($db in $vmProtectedDBs) {
+                $state = $db.properties.protectionState
+                $policy = $db.properties.policyName
+                $lastBackup = $db.properties.lastBackupTime
+                $stateColor = if ($state -eq "ProtectionStopped") { "Yellow" } else { "White" }
+
+                Write-Host "  [$dbIdx] $($db.properties.friendlyName)" -ForegroundColor $stateColor
+                Write-Host "       Instance:       $($db.properties.parentName)" -ForegroundColor Gray
+                Write-Host "       State:          $state" -ForegroundColor Gray
+                Write-Host "       Policy:         $policy" -ForegroundColor Gray
+                Write-Host "       Last Backup:    $lastBackup" -ForegroundColor Gray
+                Write-Host ""
+                $dbIdx++
+            }
         }
     } else {
         Write-Host "  No protected SQL databases found on VM '$vmName'." -ForegroundColor Yellow
@@ -586,20 +727,10 @@ if ($Unregister) {
     if ($vmProtectedDBs.Count -eq 0) {
         Write-Host "  No protected items to stop. Proceeding to container unregistration." -ForegroundColor Yellow
     } else {
-        Write-Host "  Stopping protection for $($vmProtectedDBs.Count) database(s) with retain data..." -ForegroundColor Cyan
-        Write-Host ""
-
-        foreach ($db in $vmProtectedDBs) {
-            $currentState = $db.properties.protectionState
-            if ($currentState -eq "ProtectionStopped") {
-                Write-Host "    SKIPPED: '$($db.properties.friendlyName)' - protection already stopped" -ForegroundColor Yellow
-                $stopSkipCount++
-                continue
-            }
-
-            $result = Stop-SQLDatabaseProtection -ProtectedItem $db -Headers $headers -ApiVersion $apiVersion
-            if ($result) { $stopSuccessCount++ } else { $stopFailCount++ }
-        }
+        $stopResult = Stop-SQLDatabasesParallel -ProtectedItems $vmProtectedDBs -Headers $headers -ApiVersion $apiVersion
+        $stopSuccessCount = $stopResult.Succeeded
+        $stopFailCount = $stopResult.Failed
+        $stopSkipCount = $stopResult.Skipped
 
         Write-Host ""
         Write-Host "  Stop Protection Summary: $stopSuccessCount stopped, $stopSkipCount already stopped, $stopFailCount failed" -ForegroundColor Cyan
@@ -727,9 +858,36 @@ if ($vmProtectedDBs.Count -gt 0) {
 
     if (-not [string]::IsNullOrWhiteSpace($DatabaseName)) {
         # Specific database provided
-        $targetDB = $vmProtectedDBs | Where-Object {
-            $_.properties.friendlyName -eq $DatabaseName -or
-            $_.properties.friendlyName -ieq $DatabaseName
+        if (-not [string]::IsNullOrWhiteSpace($InstanceName)) {
+            # Filter by both DatabaseName and InstanceName
+            $targetDB = $vmProtectedDBs | Where-Object {
+                $_.properties.friendlyName -ieq $DatabaseName -and $_.properties.parentName -ieq $InstanceName
+            }
+        } else {
+            $targetDB = $vmProtectedDBs | Where-Object {
+                $_.properties.friendlyName -eq $DatabaseName -or
+                $_.properties.friendlyName -ieq $DatabaseName
+            }
+            
+            # If multiple matches (same DB name in different instances), warn and prompt
+            if ($targetDB -is [array] -and $targetDB.Count -gt 1) {
+                Write-Host "  WARNING: Database '$DatabaseName' exists in multiple instances:" -ForegroundColor Yellow
+                $mIdx = 1
+                foreach ($mdb in $targetDB) {
+                    Write-Host "    [$mIdx] $($mdb.properties.friendlyName) (Instance: $($mdb.properties.parentName))" -ForegroundColor White
+                    $mIdx++
+                }
+                Write-Host ""
+                Write-Host "  TIP: Use -InstanceName to target a specific instance." -ForegroundColor Cyan
+                $mChoice = Read-Host '  Select instance (default: 1)'
+                if ([string]::IsNullOrWhiteSpace($mChoice)) { $mChoice = "1" }
+                $mSelectedIdx = [int]$mChoice - 1
+                if ($mSelectedIdx -ge 0 -and $mSelectedIdx -lt $targetDB.Count) {
+                    $targetDB = $targetDB[$mSelectedIdx]
+                } else {
+                    $targetDB = $targetDB[0]
+                }
+            }
         }
 
         if ($targetDB) {
@@ -779,19 +937,23 @@ if ($vmProtectedDBs.Count -gt 0) {
         }
     }
 
-    # Execute stop protection for each selected database
-    foreach ($db in $dbsToStop) {
-        $result = Stop-SQLDatabaseProtection -ProtectedItem $db -Headers $headers -ApiVersion $apiVersion
-        if ($result) { $successCount++ } else { $failCount++ }
-    }
+    # Execute stop protection in parallel
+    if ($dbsToStop.Count -gt 0) {
+        $stopResult = Stop-SQLDatabasesParallel -ProtectedItems $dbsToStop -Headers $headers -ApiVersion $apiVersion
+        $successCount = $stopResult.Succeeded
+        $failCount = $stopResult.Failed
 
-    Write-Host ""
-    Write-Host "  Stop Protection Summary:" -ForegroundColor Cyan
-    Write-Host "    Succeeded: $successCount" -ForegroundColor Green
-    if ($failCount -gt 0) {
-        Write-Host "    Failed:    $failCount" -ForegroundColor Red
+        Write-Host ""
+        Write-Host "  Stop Protection Summary:" -ForegroundColor Cyan
+        Write-Host "    Succeeded: $successCount" -ForegroundColor Green
+        if ($stopResult.Skipped -gt 0) {
+            Write-Host "    Skipped:   $($stopResult.Skipped)" -ForegroundColor Yellow
+        }
+        if ($failCount -gt 0) {
+            Write-Host "    Failed:    $failCount" -ForegroundColor Red
+        }
+        Write-Host ""
     }
-    Write-Host ""
 }
 
 # ============================================================================

@@ -65,6 +65,8 @@ WORKFLOW
 --------
   1. Authenticates to Azure (PowerShell or CLI).
   2. Lists protected SQL databases on the source VM.
+     - Groups databases by instance when multiple SQL instances exist.
+     - Filters to -InstanceName if provided.
      If -DatabaseName not specified, shows numbered list for selection.
   3. Lists recovery points (Full, Differential, Log) for the selected database.
      If -RecoveryPointId not specified, shows numbered list for selection.
@@ -127,10 +129,30 @@ PARAMETERS
     -TargetFilePath         Directory for .bak/.log files. Example: D:\Backup1234
 
   Optional:
-    -DatabaseName           SQL database to restore. If omitted, lists DBs for selection.
-    -RecoveryPointId        Recovery point ID. If omitted, lists RPs for selection.
-    -PointInTime            ISO 8601 datetime for log restore. Example: "2026-03-12T18:30:00Z"
-    -OverwriteExisting      Switch to overwrite existing DB/files. Default: FailOnConflict.
+    -InstanceName           SQL instance name (e.g. MSSQLSERVER, SQLEXPRESS).
+                            Filters source databases to this instance.
+                            Useful when same DB name exists in multiple instances.
+    -DatabaseName           SQL database to restore. If omitted, lists DBs
+                            for selection.
+    -RecoveryPointId        Recovery point ID. If omitted, lists RPs for
+                            selection.
+    -PointInTime            ISO 8601 datetime for log restore.
+                            Example: "2026-03-12T18:30:00Z"
+    -OverwriteExisting      Switch to overwrite existing DB/files.
+                            Default: FailOnConflict.
+
+
+SCENARIOS
+---------
+
+  1. Source Database Selection
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  Params                                          Interactive?
+  ------                                          ------------
+  (no -DatabaseName)                              Yes - lists DBs for selection
+  -DatabaseName "X"                               NO (prompts if ambiguous)
+  -DatabaseName "X" -InstanceName "I"             NO - exact match
+  -DatabaseName "X" (exists in 2+ instances)      Prompts to pick instance
 
 
 API VERSION
@@ -223,7 +245,27 @@ Example 2 - Full ALR: With all parameters (non-interactive)
         -TargetLogPath "D:\SQLLogs"
 
 
-Example 3 - Point-in-Time ALR
+Example 3 - Restore from a specific instance (multi-instance VM)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  PS> .\Restore-SQLIaaSVM-FromVault.ps1 `
+        -VaultSubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
+        -VaultResourceGroup "rg-vault" `
+        -VaultName "myVault" `
+        -VMResourceGroup "rg-sql" `
+        -VMName "sql-vm-01" `
+        -InstanceName "SQLEXPRESS" `
+        -DatabaseName "SalesDB" `
+        -RestoreType ALR `
+        -TargetVMName "sql-vm-01" `
+        -TargetVMResourceGroup "rg-sql" `
+        -TargetDatabaseName "MSSQLSERVER/SalesDB_Restored" `
+        -TargetDataPath "D:\SQLData" `
+        -TargetLogPath "D:\SQLLogs"
+
+  Restores SalesDB specifically from the SQLEXPRESS instance.
+
+
+Example 4 - Point-in-Time ALR
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   PS> .\Restore-SQLIaaSVM-FromVault.ps1 `
         -VaultSubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
@@ -244,7 +286,7 @@ Example 3 - Point-in-Time ALR
   Source file layout is fetched from the latest Full recovery point.
 
 
-Example 4 - Restore as Files (Full)
+Example 5 - Restore as Files (Full)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   PS> .\Restore-SQLIaaSVM-FromVault.ps1 `
         -VaultSubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
@@ -259,7 +301,7 @@ Example 4 - Restore as Files (Full)
         -TargetFilePath "D:\Backup1234"
 
 
-Example 5 - Restore as Files (Point-in-Time)
+Example 6 - Restore as Files (Point-in-Time)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   PS> .\Restore-SQLIaaSVM-FromVault.ps1 `
         -VaultSubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
@@ -275,7 +317,7 @@ Example 5 - Restore as Files (Point-in-Time)
         -TargetFilePath "D:\Backup1234"
 
 
-Example 6 - ALR to a different VM
+Example 7 - ALR to a different VM
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   PS> .\Restore-SQLIaaSVM-FromVault.ps1 `
         -VaultSubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
@@ -302,6 +344,20 @@ ALL RESTORE COMBINATIONS
   ALR             Specified       Point-in-Time ALR (log restore)
   RestoreAsFiles  Not specified   Full restore as .bak files
   RestoreAsFiles  Specified       Point-in-Time restore as .bak files
+
+
+SMART BEHAVIORS
+---------------
+  - Multiple instances:     Groups databases by instance in the display.
+  - -DatabaseName in 2+ instances: Prompts to pick, suggests -InstanceName.
+  - -InstanceName not found: Lists available instances, exits with error.
+  - Single database:        Auto-selects it without prompting.
+  - ARM IDs lowercased:     All ARM resource IDs in the request body are
+                            automatically lowercased (API requirement).
+  - Source file info:       Fetched from recovery point extended info for
+                            accurate file placement in ALR.
+  - PIT file layout:        For Point-in-Time restores, fetches file layout
+                            from the latest Full recovery point.
 
 
 IMPORTANT NOTES
@@ -342,6 +398,11 @@ Common issues:
   - Restore fails with conflict:
       Target database already exists. Use -OverwriteExisting or choose
       a different target database name.
+
+  - SecureString token:
+      Newer Az.Accounts modules return SecureString tokens.
+      The script handles both formats automatically
+      (uses NetworkCredential method for cross-platform).
 
 
 PUBLIC DOCUMENTATION
