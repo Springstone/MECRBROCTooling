@@ -74,7 +74,7 @@ INPUTS (PROMPTED AT RUNTIME)
 
 API VERSION USED
 ----------------
-  - 2019-05-13   Protected item query, stop-protection PUT
+  - 2025-08-01   All operations (protected item query, stop-protection PUT)
 
 
 EXAMPLES

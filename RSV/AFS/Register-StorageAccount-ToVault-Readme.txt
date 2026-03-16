@@ -66,7 +66,7 @@ INPUTS (PROMPTED AT RUNTIME)
 
 API VERSION USED
 ----------------
-  - 2016-12-01   Container discovery, protectable containers, registration
+  - 2025-08-01   All operations (container discovery, protectable containers, registration)
 
 
 EXAMPLES

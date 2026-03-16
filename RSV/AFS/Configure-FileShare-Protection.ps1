@@ -27,8 +27,7 @@
 # CONFIGURATION
 # ============================================================================
 
-$apiVersion = "2019-05-13"  # Azure Backup REST API version for protection operations
-$containerApiVersion = "2016-12-01"  # For container/inquire operations
+$apiVersion = "2025-08-01"  # Azure Backup REST API version
 
 # Load System.Web for URL encoding (required in PowerShell 7)
 Add-Type -AssemblyName System.Web
@@ -137,12 +136,14 @@ $authMethod = $null
 
 # Try Azure PowerShell first
 try {
-    $tokenResult = Get-AzAccessToken -ResourceUrl "https://management.azure.com"
-    # Az.Accounts >= 2.13.0 returns SecureString; older versions return plain string
-    if ($tokenResult.Token -is [System.Security.SecureString]) {
-        $token = $tokenResult.Token | ConvertFrom-SecureString -AsPlainText
+    $tokenResponse = Get-AzAccessToken -ResourceUrl "https://management.azure.com"
+    if ($tokenResponse.Token -is [System.Security.SecureString]) {
+        $token = $tokenResponse.Token | ConvertFrom-SecureString -AsPlainText
     } else {
-        $token = $tokenResult.Token
+        $token = $tokenResponse.Token
+    }
+    if ([string]::IsNullOrWhiteSpace($token) -or $token.Length -lt 100) {
+        throw "Token appears invalid (length: $($token.Length))"
     }
     $authMethod = "Azure PowerShell"
     Write-Host "  Authentication successful (Azure PowerShell)" -ForegroundColor Green
@@ -191,7 +192,7 @@ Write-Host ""
 
 Write-Host "Checking if storage account is registered to vault..." -ForegroundColor Cyan
 
-$verifyContainerUri = "https://management.azure.com/subscriptions/$vaultSubscriptionId/resourceGroups/$vaultResourceGroup/providers/Microsoft.RecoveryServices/vaults/$vaultName/backupFabrics/Azure/protectionContainers/$containerName`?api-version=$containerApiVersion"
+$verifyContainerUri = "https://management.azure.com/subscriptions/$vaultSubscriptionId/resourceGroups/$vaultResourceGroup/providers/Microsoft.RecoveryServices/vaults/$vaultName/backupFabrics/Azure/protectionContainers/$containerName`?api-version=$apiVersion"
 
 try {
     $containerResponse = Invoke-RestMethod -Uri $verifyContainerUri -Method GET -Headers $headers
@@ -233,7 +234,7 @@ Write-Host ""
 
 Write-Host "Triggering inquire operation to discover file shares..." -ForegroundColor Cyan
 
-$inquireUri = "https://management.azure.com/subscriptions/$vaultSubscriptionId/resourceGroups/$vaultResourceGroup/providers/Microsoft.RecoveryServices/vaults/$vaultName/backupFabrics/Azure/protectionContainers/$containerName/inquire?api-version=$containerApiVersion"
+$inquireUri = "https://management.azure.com/subscriptions/$vaultSubscriptionId/resourceGroups/$vaultResourceGroup/providers/Microsoft.RecoveryServices/vaults/$vaultName/backupFabrics/Azure/protectionContainers/$containerName/inquire?api-version=$apiVersion"
 
 try {
     $inquireResponse = Invoke-RestMethod -Uri $inquireUri -Method POST -Headers $headers
@@ -264,7 +265,7 @@ Write-Host ""
 
 Write-Host "Querying for protectable file shares..." -ForegroundColor Cyan
 
-$protectableItemsUri = "https://management.azure.com/subscriptions/$vaultSubscriptionId/resourceGroups/$vaultResourceGroup/providers/Microsoft.RecoveryServices/vaults/$vaultName/backupProtectableItems?api-version=$containerApiVersion&`$filter=backupManagementType eq 'AzureStorage'"
+$protectableItemsUri = "https://management.azure.com/subscriptions/$vaultSubscriptionId/resourceGroups/$vaultResourceGroup/providers/Microsoft.RecoveryServices/vaults/$vaultName/backupProtectableItems?api-version=$apiVersion&`$filter=backupManagementType eq 'AzureStorage'"
 
 $protectableItemId = $null
 $protectedItemName = $null
@@ -510,7 +511,7 @@ try {
     
     # Wait for protection to complete
     Write-Host "Configuring backup protection..." -ForegroundColor Cyan
-    Start-Sleep -Seconds 10
+    Start-Sleep -Seconds 50
     
     # Verify protection status
     Write-Host "Verifying protection status..." -ForegroundColor Cyan
@@ -532,11 +533,12 @@ try {
         Write-Host ""
         Write-Host "Next Steps:" -ForegroundColor Yellow
         Write-Host "  1. Backup will run automatically according to the policy schedule" -ForegroundColor White
-        Write-Host "  2. You can trigger an on-demand backup using Trigger-FileShare-Backup.ps1" -ForegroundColor White
+        Write-Host "  2. You can trigger an on-demand backup from Azure Portal -> Vault -> Backup Items" -ForegroundColor White
         Write-Host "  3. Monitor backup jobs in Azure Portal > Recovery Services Vault > Backup Jobs" -ForegroundColor White
         Write-Host ""
     } catch {
         Write-Host "  WARNING: Protection configured but verification failed" -ForegroundColor Yellow
+        Write-Host "  Error: $($_.Exception.Message)" -ForegroundColor Yellow
         Write-Host "  Please check the Azure Portal to verify protection status." -ForegroundColor Yellow
         Write-Host ""
     }

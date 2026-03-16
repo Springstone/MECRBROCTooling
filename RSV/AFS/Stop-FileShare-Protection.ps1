@@ -37,7 +37,7 @@
 # CONFIGURATION
 # ============================================================================
 
-$apiVersion = "2019-05-13"  # Azure Backup REST API version
+$apiVersion = "2025-08-01"  # Azure Backup REST API version
 
 # Load System.Web for URL encoding (required in PowerShell 7)
 Add-Type -AssemblyName System.Web
@@ -152,12 +152,14 @@ $authMethod = $null
 
 # Try Azure PowerShell first
 try {
-    $tokenResult = Get-AzAccessToken -ResourceUrl "https://management.azure.com"
-    # Az.Accounts >= 2.13.0 returns SecureString; older versions return plain string
-    if ($tokenResult.Token -is [System.Security.SecureString]) {
-        $token = $tokenResult.Token | ConvertFrom-SecureString -AsPlainText
+    $tokenResponse = Get-AzAccessToken -ResourceUrl "https://management.azure.com"
+    if ($tokenResponse.Token -is [System.Security.SecureString]) {
+        $token = $tokenResponse.Token | ConvertFrom-SecureString -AsPlainText
     } else {
-        $token = $tokenResult.Token
+        $token = $tokenResponse.Token
+    }
+    if ([string]::IsNullOrWhiteSpace($token) -or $token.Length -lt 100) {
+        throw "Token appears invalid (length: $($token.Length))"
     }
     $authMethod = "Azure PowerShell"
     Write-Host "  Authentication successful (Azure PowerShell)" -ForegroundColor Green
@@ -336,16 +338,33 @@ try {
     Write-Host "  Stop-protection request submitted successfully!" -ForegroundColor Green
     Write-Host ""
     
-    # Wait for the operation to take effect
+    # Poll until protection state changes to ProtectionStopped
     Write-Host "Waiting for protection state to update..." -ForegroundColor Cyan
-    Start-Sleep -Seconds 10
     
-    # Verify the updated status
-    Write-Host "Verifying updated protection status..." -ForegroundColor Cyan
+    $maxRetries = 10
+    $retryCount = 0
+    $stateStopped = $false
     
-    try {
-        $verifyResponse = Invoke-RestMethod -Uri $protectedItemUri -Method GET -Headers $headers
+    while (-not $stateStopped -and $retryCount -lt $maxRetries) {
+        Start-Sleep -Seconds 10
         
+        try {
+            $verifyResponse = Invoke-RestMethod -Uri $protectedItemUri -Method GET -Headers $headers
+            $currentState = $verifyResponse.properties.protectionState
+            
+            if ($currentState -eq "ProtectionStopped") {
+                $stateStopped = $true
+            } else {
+                $retryCount++
+                Write-Host "  State: $currentState - waiting... ($retryCount/$maxRetries)" -ForegroundColor Yellow
+            }
+        } catch {
+            $retryCount++
+            Write-Host "  Polling... ($retryCount/$maxRetries)" -ForegroundColor Yellow
+        }
+    }
+    
+    if ($stateStopped) {
         Write-Host ""
         Write-Host "========================================" -ForegroundColor Green
         Write-Host "  PROTECTION STOPPED SUCCESSFULLY!" -ForegroundColor Green
@@ -364,11 +383,13 @@ try {
         Write-Host ""
         Write-Host "Next Steps:" -ForegroundColor Yellow
         Write-Host "  1. To resume protection: re-assign a backup policy using Configure-FileShare-Protection.ps1" -ForegroundColor White
-        Write-Host "  2. To delete backup data: use Azure Portal > Vault > Backup Items > Stop backup > Delete data" -ForegroundColor White
+        Write-Host "  2. To delete backup data: use Azure Portal -> Vault -> Backup Items -> Delete data" -ForegroundColor White
         Write-Host "  3. To restore from retained data: use Restore-AzureFileShare-RestAPI.ps1" -ForegroundColor White
         Write-Host ""
-    } catch {
-        Write-Host "  Stop-protection submitted but verification returned an error." -ForegroundColor Yellow
+    } else {
+        Write-Host ""
+        Write-Host "  Stop-protection submitted but state has not changed yet." -ForegroundColor Yellow
+        Write-Host "  Last observed state: $currentState" -ForegroundColor Yellow
         Write-Host "  Please check the Azure Portal to verify protection status." -ForegroundColor Yellow
         Write-Host ""
     }

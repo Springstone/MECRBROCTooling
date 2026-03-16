@@ -116,7 +116,7 @@ INPUTS (PROMPTED AT RUNTIME)
 
 API VERSION USED
 ----------------
-  - 2019-05-13   All operations (protected items, recovery points, restore)
+  - 2025-08-01   All operations (protected items, recovery points, restore)
 
 
 EXAMPLES

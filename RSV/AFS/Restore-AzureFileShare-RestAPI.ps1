@@ -29,7 +29,7 @@
 # CONFIGURATION
 # ============================================================================
 
-$apiVersion = "2019-05-13"  # Azure Backup REST API version
+$apiVersion = "2025-08-01"  # Azure Backup REST API version
 
 # Load System.Web for URL encoding (required in PowerShell 7)
 Add-Type -AssemblyName System.Web
@@ -145,12 +145,14 @@ $authMethod = $null
 
 # Try Azure PowerShell first
 try {
-    $tokenResult = Get-AzAccessToken -ResourceUrl "https://management.azure.com"
-    # Az.Accounts >= 2.13.0 returns SecureString; older versions return plain string
-    if ($tokenResult.Token -is [System.Security.SecureString]) {
-        $token = $tokenResult.Token | ConvertFrom-SecureString -AsPlainText
+    $tokenResponse = Get-AzAccessToken -ResourceUrl "https://management.azure.com"
+    if ($tokenResponse.Token -is [System.Security.SecureString]) {
+        $token = $tokenResponse.Token | ConvertFrom-SecureString -AsPlainText
     } else {
-        $token = $tokenResult.Token
+        $token = $tokenResponse.Token
+    }
+    if ([string]::IsNullOrWhiteSpace($token) -or $token.Length -lt 100) {
+        throw "Token appears invalid (length: $($token.Length))"
     }
     $authMethod = "Azure PowerShell"
     Write-Host "  Authentication successful (Azure PowerShell)" -ForegroundColor Green
@@ -657,8 +659,9 @@ try {
         Write-Host ""
         
         # Extract operation tracking URIs
-        $locationHeader = $restoreResponse.Headers["Location"]
-        $azureAsyncHeader = $restoreResponse.Headers["Azure-AsyncOperation"]
+        # PS7 returns headers as String[] — take first element
+        $locationHeader = $restoreResponse.Headers["Location"] | Select-Object -First 1
+        $azureAsyncHeader = $restoreResponse.Headers["Azure-AsyncOperation"] | Select-Object -First 1
         
         if ($azureAsyncHeader) {
             Write-Host "Tracking operation status..." -ForegroundColor Cyan
