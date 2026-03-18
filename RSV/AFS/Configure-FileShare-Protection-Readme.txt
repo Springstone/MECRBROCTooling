@@ -75,7 +75,7 @@ INPUTS (PROMPTED AT RUNTIME)
                                 Account (Storage Account region) and transferred
                                 to the Recovery Services Vault (Vault region).
     Verify your policy tier in the Azure Portal before selecting:
-      Recovery Services Vault > Backup Policies > Select Policy > Backup tier
+      Recovery Services Vault > Backup Policies > Select Policy and look for 'Backup tier'
 
 
 API VERSION USED
