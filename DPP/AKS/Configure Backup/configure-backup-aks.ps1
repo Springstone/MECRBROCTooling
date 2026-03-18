@@ -44,6 +44,19 @@
 
 .EXAMPLE
     .\configure-backup-aks.ps1 -VaultRegion swedencentral -ClusterId "/subscriptions/<sub-id>/resourceGroups/<cluster-rg>/providers/Microsoft.ContainerService/managedClusters/<cluster-name>" -VaultResourceGroup "<vault-rg>" -Subscription "<sub-id>" -VaultName "<vault-name>"
+
+.NOTES
+    TROUBLESHOOTING - If failures appear to be caused by Azure CLI issues (e.g. unknown commands,
+    missing parameters, or extension errors), try the following steps:
+
+    1. Upgrade the Azure CLI to the latest version:
+         az upgrade
+
+    2. Remove and reinstall the aks-preview extension:
+         az extension remove --name aks-preview
+         az extension add --name aks-preview
+
+    3. Re-run the script after the above steps.
 #>
 
 param(
@@ -66,7 +79,7 @@ param(
 
     [string]$StorageAccountResourceGroup = "",
 
-    [string]$BlobContainerName = "aksbackup",
+    [string]$BlobContainerName = "",
 
     [hashtable]$Tags = @{
         "createdby" = "configure-backup-aks"
@@ -79,12 +92,27 @@ $ErrorActionPreference = "Stop"
 if (-not $VaultName) { $VaultName = "test-vault-$VaultRegion" }
 if (-not $StorageAccountName) { $StorageAccountName = "testsabackup" + (Get-Random -Maximum 999) }
 if (-not $StorageAccountResourceGroup) { $StorageAccountResourceGroup = $VaultResourceGroup }
-$policyName = "test-policy-30d-90d"
+$policyName = "Vault-Tier-Policy-Daily-30dOp-90dVault"
 
 # Extract cluster details from ARM ID
 $clusterParts = $ClusterId -split '/'
+$clusterSubscription = $clusterParts[2]
 $clusterRg = $clusterParts[4]
 $clusterName = $clusterParts[8]
+
+# Validate cluster and vault are in the same subscription
+if ($clusterSubscription -ne $Subscription) {
+    Write-Host "ERROR: Cluster subscription ($clusterSubscription) does not match the vault subscription ($Subscription)." -ForegroundColor Red
+    Write-Host "This script requires the AKS cluster and backup vault to be in the same subscription." -ForegroundColor Red
+    exit 1
+}
+
+# Derive blob container name from cluster RG and name if not specified
+if (-not $BlobContainerName) {
+    $BlobContainerName = ("$clusterRg-$clusterName").ToLower() -replace '[^a-z0-9-]', '' -replace '^-+|-+$', ''
+    # Blob container names must be 3-63 chars
+    if ($BlobContainerName.Length -gt 63) { $BlobContainerName = $BlobContainerName.Substring(0, 63).TrimEnd('-') }
+}
 
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host "  Configure AKS Backup E2E Script" -ForegroundColor Cyan
@@ -126,6 +154,16 @@ if ($k8sExt) {
     Write-Host "  k8s-extension installed" -ForegroundColor Green
 }
 
+$aksPreview = az extension show -n aks-preview --query version -o tsv 2>$null
+if ($aksPreview) {
+    Write-Host "  aks-preview extension installed (v$aksPreview)"
+} else {
+    Write-Host "  Installing aks-preview extension..." -ForegroundColor Yellow
+    az extension add -n aks-preview --yes 2>$null
+    $aksPreview = az extension show -n aks-preview --query version -o tsv 2>$null
+    Write-Host "  aks-preview extension installed (v$aksPreview)" -ForegroundColor Green
+}
+
 $ErrorActionPreference = $prevEAP
 
 # ---- Step 2: Set Subscription ----
@@ -138,6 +176,20 @@ Write-Host "  Active subscription: $currentSub"
 # ---- Step 3: Create Backup Vault ----
 Write-Host ""
 Write-Host "[3/8] Creating backup vault: $VaultName in $VaultRegion..." -ForegroundColor Yellow
+
+# Ensure vault resource group exists
+$existingRg = az group show --name $VaultResourceGroup --query name -o tsv 2>$null
+if ($existingRg -ne $VaultResourceGroup) {
+    Write-Host "  Resource group '$VaultResourceGroup' does not exist. Creating..." -ForegroundColor Yellow
+    az group create --name $VaultResourceGroup --location $VaultRegion -o none
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  ERROR: Failed to create resource group '$VaultResourceGroup'" -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "  Resource group created" -ForegroundColor Green
+} else {
+    Write-Host "  Resource group '$VaultResourceGroup' already exists"
+}
 
 $existingVault = az dataprotection backup-vault show -g $VaultResourceGroup --vault-name $VaultName --query name -o tsv 2>$null
 if ($existingVault -eq $VaultName) {
@@ -287,9 +339,38 @@ Write-Host "  Policy ID: $policyId"
 
 # Get cluster MSI principal ID and location (needed before extension install for SA creation)
 $clusterJson = az aks show --resource-group $clusterRg --name $clusterName -o json 2>$null
+if ($LASTEXITCODE -ne 0 -or -not $clusterJson) {
+    Write-Host "  ERROR: Failed to retrieve AKS cluster details (az aks show failed for cluster '$clusterName' in RG '$clusterRg')" -ForegroundColor Red
+    Write-Host "  Verify the ClusterId is correct and you have access to the cluster." -ForegroundColor Red
+    exit 1
+}
 $cluster = $clusterJson | ConvertFrom-Json
-$clusterPrincipalId = $cluster.identity.principalId
+if (-not $cluster.id) {
+    Write-Host "  ERROR: az aks show returned an empty or invalid response for cluster '$clusterName'" -ForegroundColor Red
+    exit 1
+}
 $clusterLocation = $cluster.location
+
+# Handle both SystemAssigned and UserAssigned managed identities
+$identityType = $cluster.identity.type
+if ($identityType -match "UserAssigned" -and $cluster.identity.userAssignedIdentities) {
+    # For user-assigned MSI, the principalId is nested under the identity resource ID key
+    $uaIdentities = $cluster.identity.userAssignedIdentities
+    $firstKey = ($uaIdentities | Get-Member -MemberType NoteProperty | Select-Object -First 1).Name
+    $clusterPrincipalId = $uaIdentities.$firstKey.principalId
+    Write-Host "  Cluster Identity Type: UserAssigned"
+    Write-Host "  Cluster UA Identity:   $firstKey"
+} else {
+    # SystemAssigned MSI - principalId is directly on identity object
+    $clusterPrincipalId = $cluster.identity.principalId
+    Write-Host "  Cluster Identity Type: SystemAssigned"
+}
+
+if (-not $clusterPrincipalId) {
+    Write-Host "  ERROR: Could not determine cluster MSI principal ID (identity type: $identityType)" -ForegroundColor Red
+    exit 1
+}
+
 Write-Host "  Cluster MSI Principal ID: $clusterPrincipalId"
 Write-Host "  Cluster Location: $clusterLocation"
 

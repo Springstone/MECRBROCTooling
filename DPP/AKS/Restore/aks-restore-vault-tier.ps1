@@ -1,6 +1,20 @@
-# =========================
-# AKS Restore from Vault Tier (Cross-Region / Vault Region Restore)
-# =========================
+<#
+.SYNOPSIS
+    AKS Restore from Vault Tier (Cross-Region / Vault Region Restore)
+
+.NOTES
+    TROUBLESHOOTING - If failures appear to be caused by Azure CLI issues (e.g. unknown commands,
+    missing parameters, or extension errors), try the following steps:
+
+    1. Upgrade the Azure CLI to the latest version:
+         az upgrade
+
+    2. Remove and reinstall the aks-preview extension:
+         az extension remove --name aks-preview
+         az extension add --name aks-preview
+
+    3. Re-run the script after the above steps.
+#>
 
 param(
     [Parameter(Mandatory = $true, HelpMessage = "Azure Subscription ID")]
@@ -49,6 +63,43 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# ---- Ensure CLI extensions are installed ----
+Write-Host "[Pre-req] Ensuring CLI extensions are installed..." -ForegroundColor Yellow
+
+$prevEAP = $ErrorActionPreference
+$ErrorActionPreference = "SilentlyContinue"
+
+$dpVersion = az extension show -n dataprotection --query version -o tsv 2>$null
+if ($dpVersion) {
+    Write-Host "  dataprotection extension installed (v$dpVersion)"
+} else {
+    Write-Host "  Installing dataprotection extension..." -ForegroundColor Yellow
+    az extension add -n dataprotection --yes 2>$null
+    $dpVersion = az extension show -n dataprotection --query version -o tsv 2>$null
+    Write-Host "  dataprotection extension installed (v$dpVersion)" -ForegroundColor Green
+}
+
+$k8sExt = az extension show -n k8s-extension --query version -o tsv 2>$null
+if ($k8sExt) {
+    Write-Host "  k8s-extension installed (v$k8sExt)"
+} else {
+    Write-Host "  Installing k8s-extension..." -ForegroundColor Yellow
+    az extension add -n k8s-extension --yes 2>$null
+    Write-Host "  k8s-extension installed" -ForegroundColor Green
+}
+
+$aksPreview = az extension show -n aks-preview --query version -o tsv 2>$null
+if ($aksPreview) {
+    Write-Host "  aks-preview extension installed (v$aksPreview)"
+} else {
+    Write-Host "  Installing aks-preview extension..." -ForegroundColor Yellow
+    az extension add -n aks-preview --yes 2>$null
+    $aksPreview = az extension show -n aks-preview --query version -o tsv 2>$null
+    Write-Host "  aks-preview extension installed (v$aksPreview)" -ForegroundColor Green
+}
+
+$ErrorActionPreference = $prevEAP
+
 # Parse namespace mapping
 $namespaceMapping = @{}
 if ($NamespaceMappingJson -and $NamespaceMappingJson -ne '{}') {
@@ -71,16 +122,49 @@ az account set --subscription $SubscriptionId
 
 # Extract location from the target cluster
 $targetParts = $TargetClusterId -split '/'
+$targetClusterSubscription = $targetParts[2]
 $targetRg = $targetParts[4]
 $targetClusterName = $targetParts[8]
-$clusterJson = az aks show --resource-group $targetRg --name $targetClusterName -o json
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "Failed to fetch target cluster details." -ForegroundColor Red
+
+# Validate cluster and vault are in the same subscription
+if ($targetClusterSubscription -ne $SubscriptionId) {
+    Write-Host "ERROR: Target cluster subscription ($targetClusterSubscription) does not match the vault subscription ($SubscriptionId)." -ForegroundColor Red
+    Write-Host "This script requires the AKS cluster and backup vault to be in the same subscription." -ForegroundColor Red
+    exit 1
+}
+
+$clusterJson = az aks show --resource-group $targetRg --name $targetClusterName -o json 2>$null
+if ($LASTEXITCODE -ne 0 -or -not $clusterJson) {
+    Write-Host "ERROR: Failed to retrieve AKS cluster details (az aks show failed for cluster '$targetClusterName' in RG '$targetRg')" -ForegroundColor Red
+    Write-Host "Verify the TargetClusterId is correct and you have access to the cluster." -ForegroundColor Red
     exit 1
 }
 $cluster = $clusterJson | ConvertFrom-Json
+if (-not $cluster.id) {
+    Write-Host "ERROR: az aks show returned an empty or invalid response for cluster '$targetClusterName'" -ForegroundColor Red
+    exit 1
+}
 $restoreLocation = $cluster.location
 Write-Host "Restore location (from target cluster): $restoreLocation" -ForegroundColor Green
+
+# Handle both SystemAssigned and UserAssigned managed identities
+$identityType = $cluster.identity.type
+if ($identityType -match "UserAssigned" -and $cluster.identity.userAssignedIdentities) {
+    $uaIdentities = $cluster.identity.userAssignedIdentities
+    $firstKey = ($uaIdentities | Get-Member -MemberType NoteProperty | Select-Object -First 1).Name
+    $clusterPrincipalId = $uaIdentities.$firstKey.principalId
+    Write-Host "  Cluster Identity Type: UserAssigned"
+    Write-Host "  Cluster UA Identity:   $firstKey"
+} else {
+    $clusterPrincipalId = $cluster.identity.principalId
+    Write-Host "  Cluster Identity Type: SystemAssigned"
+}
+
+if (-not $clusterPrincipalId) {
+    Write-Host "  ERROR: Could not determine cluster MSI principal ID (identity type: $identityType)" -ForegroundColor Red
+    exit 1
+}
+Write-Host "  Cluster MSI Principal ID: $clusterPrincipalId" -ForegroundColor Green
 
 # -------------------------------------------------------
 # Pre-check: Verify backup extension is installed on target cluster
@@ -116,8 +200,7 @@ if (-not $SkipPermissions) {
     $vaultId = $vault.id
     Write-Host "  Vault MSI Principal ID: $vaultPrincipalId"
 
-    # Get cluster MSI principal ID
-    $clusterPrincipalId = $cluster.identity.principalId
+    # Cluster MSI principal ID already resolved above (handles both SystemAssigned and UserAssigned)
     Write-Host "  Cluster MSI Principal ID: $clusterPrincipalId"
 
     # --- Trusted Access ---
