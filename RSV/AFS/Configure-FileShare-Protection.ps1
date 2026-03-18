@@ -423,6 +423,13 @@ try {
                 $policyIndex++
             }
             
+            # Caution: Policy tier behavior
+            Write-Host "  CAUTION:" -ForegroundColor DarkYellow
+            Write-Host "    - 'Snapshot' policy       : Backups are stored as snapshots in the Storage Account only, in the Storage Account region." -ForegroundColor DarkYellow
+            Write-Host "    - 'Vault-Standard' policy : Backups are stored as snapshots in the Storage Account (Storage Account region) and transferred to the Recovery Services Vault (Vault region)." -ForegroundColor DarkYellow
+            Write-Host "    Please verify your policy tier in the Azure Portal (Recovery Services Vault > Backup Policies > Select Policy and look for 'Backup tier') before selecting." -ForegroundColor DarkYellow
+            Write-Host ""
+            
             # User selects policy
             Write-Host "Select a backup policy (enter number):" -ForegroundColor Cyan
             $selectedPolicyIndex = Read-Host "  Enter policy number"
