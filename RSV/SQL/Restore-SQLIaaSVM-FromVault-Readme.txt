@@ -405,6 +405,16 @@ Common issues:
       (uses NetworkCredential method for cross-platform).
 
 
+RECENT FIXES (March 19, 2026)
+-----------------------------
+  - Cross-RG container matching: Protected item filtering now uses full
+    container name pattern (VMAppContainer;Compute;{RG};{VM}) as primary
+    match instead of last-segment-only matching. Prevents restoring from
+    a VM with the same name in a different resource group.
+  - Fallback with warning: If no items match by full container name,
+    falls back to name-only matching with a WARNING message.
+
+
 PUBLIC DOCUMENTATION
 --------------------
   Restore SQL databases in Azure VMs with REST API:

@@ -522,17 +522,30 @@ try {
 
     # Filter to items belonging to our VM (exact match on container name pattern)
     # Container name format: VMAppContainer;Compute;{resourceGroup};{vmName}
-    # We match on the exact ";{vmName}" suffix or the full container pattern to avoid
-    # matching VMs with similar names (e.g., sql-vm matching sql-vm-01)
-    $expectedContainerSuffix = ";$vmName".ToLower()
+    # We extract the last segment (VM name) and compare exactly to avoid
+    # false positives with similar names (e.g., ";sql-vm" suffix would match "prod-sql-vm")
+    $vmNameLower = $vmName.ToLower()
     $expectedContainerFull = "VMAppContainer;Compute;$vmResourceGroup;$vmName".ToLower()
     $vmProtectedDBs = $allProtectedItems | Where-Object {
         $cn = if ($_.properties.containerName) { $_.properties.containerName.ToLower() } else { "" }
         $itemId = if ($_.id) { $_.id.ToLower() } else { "" }
-        # Match: container name ends with ;vmName (exact VM) OR full container pattern in ID
-        $cn.EndsWith($expectedContainerSuffix) -or
-        $cn -ieq $expectedContainerFull -or
-        $itemId.Contains($expectedContainerFull)
+        $idContainerName = ""
+        if ($itemId -match "/protectioncontainers/([^/]+)/") { $idContainerName = $Matches[1] }
+        # Match by full container name including resource group (prevents cross-RG false matches)
+        ($cn -ieq $expectedContainerFull) -or
+        ($idContainerName -ieq $expectedContainerFull)
+    }
+
+    # Fallback: if no items found with full match, try name-only (for backward compat)
+    if ($vmProtectedDBs.Count -eq 0) {
+        $vmProtectedDBs = $allProtectedItems | Where-Object {
+            $cn = if ($_.properties.containerName) { $_.properties.containerName.ToLower() } else { "" }
+            $cnLastSegment = if ($cn.Contains(";")) { $cn.Split(";")[-1] } else { $cn }
+            $cnLastSegment -ieq $vmNameLower
+        }
+        if ($vmProtectedDBs.Count -gt 0) {
+            Write-Host "  WARNING: Matched by VM name only (no RG match). Verify container: $($vmProtectedDBs[0].properties.containerName)" -ForegroundColor Yellow
+        }
     }
 
     if ($vmProtectedDBs.Count -gt 0) {
@@ -675,8 +688,10 @@ if ($Unregister) {
             }
             $containerNameLower = $containerName.ToLower()
             $vmProtectedDBs = $allItems2 | Where-Object {
-                ($_.properties.containerName -and $_.properties.containerName.ToLower().Contains($containerNameLower)) -or
-                ($_.id -and $_.id.ToLower().Contains($containerNameLower))
+                $cnRequery = if ($_.properties.containerName) { $_.properties.containerName.ToLower() } else { "" }
+                $idContainer = ""
+                if ($_.id -and $_.id -match "/protectionContainers/([^/]+)/") { $idContainer = $Matches[1].ToLower() }
+                ($cnRequery -ieq $containerNameLower) -or ($idContainer -ieq $containerNameLower)
             }
             if ($vmProtectedDBs.Count -gt 0) {
                 Write-Host "  Found $($vmProtectedDBs.Count) protected database(s) via container name match." -ForegroundColor Green

@@ -522,12 +522,29 @@ try {
         }
     }
     
-    # Filter to items belonging to our VM
+    # Filter to items belonging to our VM (exact segment match to avoid false positives)
+    # e.g., ";sql-vm" suffix would falsely match "prod-sql-vm"
+    $vmNameLowerRestore = $vmName.ToLower()
+    $expectedContainerFullRestore = "VMAppContainer;Compute;$vmResourceGroup;$vmName".ToLower()
     $vmProtectedDBs = $allProtectedItems | Where-Object {
-        $expectedContainerSuffix = ";$vmName".ToLower()
-        $expectedContainerFull = "VMAppContainer;Compute;$vmResourceGroup;$vmName".ToLower()
-        $_.properties.containerName -and $_.properties.containerName.ToLower().EndsWith($expectedContainerSuffix) -or
-        $_.id -and $_.id.ToLower().Contains($expectedContainerFull)
+        $cn = if ($_.properties.containerName) { $_.properties.containerName.ToLower() } else { "" }
+        $idContainer = ""
+        if ($_.id -and $_.id -match "/protectionContainers/([^/]+)/") { $idContainer = $Matches[1].ToLower() }
+        # Match by full container name including resource group (prevents cross-RG false matches)
+        ($cn -ieq $expectedContainerFullRestore) -or
+        ($idContainer -ieq $expectedContainerFullRestore)
+    }
+
+    # Fallback: if no items found with full match, try name-only (for backward compat)
+    if ($vmProtectedDBs.Count -eq 0) {
+        $vmProtectedDBs = $allProtectedItems | Where-Object {
+            $cn = if ($_.properties.containerName) { $_.properties.containerName.ToLower() } else { "" }
+            $cnLastSegment = if ($cn.Contains(";")) { $cn.Split(";")[-1] } else { $cn }
+            $cnLastSegment -ieq $vmNameLowerRestore
+        }
+        if ($vmProtectedDBs.Count -gt 0) {
+            Write-Host "  WARNING: Matched by VM name only (no RG match). Verify container: $($vmProtectedDBs[0].properties.containerName)" -ForegroundColor Yellow
+        }
     }
     
     if ($vmProtectedDBs.Count -eq 0) {

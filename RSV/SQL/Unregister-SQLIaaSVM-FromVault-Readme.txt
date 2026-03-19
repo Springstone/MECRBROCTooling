@@ -345,6 +345,17 @@ SAFETY GUARANTEES
   - Already-stopped databases are automatically skipped.
 
 
+RECENT FIXES (March 19, 2026)
+-----------------------------
+  - Cross-RG container matching: Protected item filtering now uses full
+    container name pattern (VMAppContainer;Compute;{RG};{VM}) as primary
+    match instead of last-segment-only matching. Prevents operating on
+    databases from a VM with the same name in a different resource group.
+  - Fallback with warning: If no items match by full container name,
+    falls back to name-only matching with a WARNING message so users
+    know the match is not RG-verified.
+
+
 PUBLIC DOCUMENTATION
 --------------------
   Manage SQL databases in Azure VMs with REST API:

@@ -1,0 +1,2 @@
+VaultSubscriptionId,VaultResourceGroup,VaultName,VMResourceGroup,VMName,PolicyName
+af95aa3c-30fd-41c6-a938-4b3676fc36fb,rg-vault,myVault,,,

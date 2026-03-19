@@ -263,6 +263,23 @@ Common issues:
   - Auto-protection 400:  Verify policy supports AzureWorkload type.
 
 
+RECENT FIXES (March 19, 2026)
+-----------------------------
+  - Cross-RG container matching: Protectable container discovery now uses
+    containerId (ARM resource ID) and container name pattern with resource
+    group as primary match. Prevents picking up a VM with the same name
+    from a different resource group (e.g., sqlserver-0 in IgniteSQLAGRG
+    instead of kajaiccy).
+  - SQL Instance discovery: Fixed issue where SQL instances were not found
+    because serverName is an FQDN (e.g., sqlserver-0.contoso.com) not matching
+    the short VM name. Now matches by container name in the protectable item ID.
+  - Instance fallback: When databases are found but instances are not,
+    the script extracts the container name from matched databases and
+    searches for instances on that container.
+  - Missing exit 0: Added explicit exit 0 at script end for success path
+    to prevent stale $LASTEXITCODE from propagating.
+
+
 PUBLIC DOCUMENTATION
 --------------------
   Back up SQL databases in Azure VMs with REST API:

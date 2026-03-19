@@ -426,20 +426,47 @@ try {
         Write-Host "  Found $($containersResponse.value.Count) protectable container(s)" -ForegroundColor Green
         Write-Host ""
         
-        # Find the matching VM
+        # Find the matching VM - use containerId (ARM resource ID) first for precision,
+        # then fall back to friendlyName + RG in container name, then friendlyName only
+        $matchingContainer = $null
+
+        # Priority 1: Match by containerId (most precise - includes resource group)
         $matchingContainer = $containersResponse.value | Where-Object {
-            $_.properties.friendlyName -eq $vmName
-        }
-        
-        # Also try matching by containerId (ARM resource ID)
+            $_.properties.containerId -ieq $vmResourceId
+        } | Select-Object -First 1
+
+        # Priority 2: Match by container name pattern (includes resource group)
         if (-not $matchingContainer) {
+            $expectedContainerPattern = "VMAppContainer;Compute;$vmResourceGroup;$vmName"
             $matchingContainer = $containersResponse.value | Where-Object {
-                $_.properties.containerId -eq $vmResourceId
+                $_.name -ieq $expectedContainerPattern
+            } | Select-Object -First 1
+        }
+
+        # Priority 3: Match by friendlyName + verify resource group
+        if (-not $matchingContainer) {
+            $nameMatches = @($containersResponse.value | Where-Object {
+                $_.properties.friendlyName -ieq $vmName
+            })
+            if ($nameMatches.Count -ge 1) {
+                # Always try to filter by resource group first
+                $rgFiltered = $nameMatches | Where-Object {
+                    $_.properties.containerId -imatch "/resourceGroups/$([regex]::Escape($vmResourceGroup))/"
+                } | Select-Object -First 1
+                if ($rgFiltered) {
+                    $matchingContainer = $rgFiltered
+                } elseif ($nameMatches.Count -eq 1) {
+                    # Single match but different RG - warn and use it
+                    Write-Host "  WARNING: Found VM '$vmName' but in different resource group. Using it as fallback." -ForegroundColor Yellow
+                    $matchingContainer = $nameMatches[0]
+                } else {
+                    Write-Host "  WARNING: Multiple VMs named '$vmName' found but none in resource group '$vmResourceGroup'." -ForegroundColor Yellow
+                    Write-Host "  Constructing container name manually..." -ForegroundColor Yellow
+                }
             }
         }
-        
+
         if ($matchingContainer) {
-            if ($matchingContainer -is [array]) { $matchingContainer = $matchingContainer[0] }
             
             $containerName = $matchingContainer.name
             Write-Host "  Target VM found:" -ForegroundColor Green
@@ -674,21 +701,74 @@ try {
     
     if ($allProtectableItems.Count -gt 0) {
         # Filter items belonging to our VM (exact match to avoid similar VM names)
-        $expectedContainerSuffix = ";$vmName".ToLower()
+        # e.g., ";sql-vm" suffix would falsely match "prod-sql-vm"
+        $vmNameLowerReg = $vmName.ToLower()
+        $expectedContainerFull = "VMAppContainer;Compute;$vmResourceGroup;$vmName".ToLower()
         $vmItems = $allProtectableItems | Where-Object {
             $sn = if ($_.properties.serverName) { $_.properties.serverName.ToLower() } else { "" }
             $itemId = if ($_.id) { $_.id.ToLower() } else { "" }
-            # Match on server name ending with vmName, or container pattern in ID
-            $sn.EndsWith($vmName.ToLower()) -or
-            $sn.EndsWith("$($vmName.ToLower())." ) -or
-            $sn -ieq $vmName -or
-            $itemId.Contains($expectedContainerSuffix)
+            $snClean = $sn.TrimEnd('.')
+            $idContainer = ""
+            if ($itemId -match "/protectioncontainers/([^/]+)/") { $idContainer = $Matches[1] }
+            # Match by full container name in ID (works for both databases and instances)
+            ($idContainer -ieq $expectedContainerFull) -or
+            # Also check if the item ID contains the container pattern (handles path variants)
+            ($itemId.Contains($expectedContainerFull)) -or
+            # Match serverName (VM hostname) + verify RG in container for databases
+            (($snClean -ieq $vmNameLowerReg -or $sn -ieq $vmNameLowerReg) -and $idContainer -imatch ";$([regex]::Escape($vmResourceGroup.ToLower()));")
+        }
+
+        # Fallback: if no items found with RG-aware match, try name-only
+        if ($vmItems.Count -eq 0) {
+            $vmItems = $allProtectableItems | Where-Object {
+                $sn = if ($_.properties.serverName) { $_.properties.serverName.ToLower() } else { "" }
+                $itemId = if ($_.id) { $_.id.ToLower() } else { "" }
+                $snClean = $sn.TrimEnd('.')
+                $cnLastSegment = ""
+                if ($itemId -match "/protectioncontainers/([^/]+)/") {
+                    $cn = $Matches[1]
+                    $cnLastSegment = if ($cn.Contains(";")) { $cn.Split(";")[-1] } else { $cn }
+                }
+                ($snClean -ieq $vmNameLowerReg) -or ($sn -ieq $vmNameLowerReg) -or ($cnLastSegment -ieq $vmNameLowerReg)
+            }
+            if ($vmItems.Count -gt 0) {
+                Write-Host "  WARNING: Matched protectable items by server name only (no RG match). Verify results." -ForegroundColor Yellow
+            }
         }
         
         # Separate databases and instances
-        $sqlDatabases = $vmItems | Where-Object { $_.properties.protectableItemType -eq "SQLDataBase" }
-        $sqlInstances = $vmItems | Where-Object { $_.properties.protectableItemType -eq "SQLInstance" }
-        
+        $sqlDatabases = @($vmItems | Where-Object { $_.properties.protectableItemType -ieq "SQLDataBase" })
+        $sqlInstances = @($vmItems | Where-Object { $_.properties.protectableItemType -ieq "SQLInstance" })
+
+        # If databases found but no instances, search for instances by container name from matched databases
+        if ($sqlDatabases.Count -gt 0 -and $sqlInstances.Count -eq 0) {
+            # Extract the actual container name from a matched database's ID
+            $dbContainerName = ""
+            if ($sqlDatabases[0].id -match "/protectionContainers/([^/]+)/") {
+                $dbContainerName = $Matches[1]
+            }
+
+            if ($dbContainerName) {
+                Write-Host "  Searching for SQL instances on container '$dbContainerName'..." -ForegroundColor Cyan
+                $sqlInstances = @($allProtectableItems | Where-Object {
+                    $_.properties.protectableItemType -ieq "SQLInstance" -and
+                    $_.id -imatch [regex]::Escape($dbContainerName)
+                })
+            }
+
+            # Still empty? Try matching by container name pattern in the full protectable items list
+            if ($sqlInstances.Count -eq 0) {
+                $sqlInstances = @($allProtectableItems | Where-Object {
+                    $_.properties.protectableItemType -ieq "SQLInstance" -and
+                    $_.id -imatch [regex]::Escape("$vmResourceGroup;$vmName")
+                })
+            }
+
+            if ($sqlInstances.Count -gt 0) {
+                Write-Host "  Found $($sqlInstances.Count) SQL instance(s) via container lookup" -ForegroundColor Green
+            }
+        }
+
         Write-Host "  Found $($sqlDatabases.Count) SQL database(s) and $($sqlInstances.Count) SQL instance(s) on VM '$vmName'" -ForegroundColor Green
         Write-Host ""
         
@@ -1473,3 +1553,5 @@ if (-not $isAlreadyProtected) {
 Write-Host ""
 Write-Host "Script completed." -ForegroundColor Cyan
 Write-Host ""
+
+exit 0
