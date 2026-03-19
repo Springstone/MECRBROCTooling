@@ -1,4 +1,2 @@
 VaultSubscriptionId,VaultResourceGroup,VaultName,VMResourceGroup,VMName
-af95aa3c-30fd-41c6-a938-4b3676fc36fb,rg-vault,myVault,rg-sql,sql-ag-node-01
-af95aa3c-30fd-41c6-a938-4b3676fc36fb,rg-vault,myVault,rg-sql,sql-ag-node-02
-af95aa3c-30fd-41c6-a938-4b3676fc36fb,rg-vault,myVault,rg-prod,sql-ag-node-03
+7e29c6d2-9018-4b97-98dd-e2c5b23c19c6,amchandnEASql,kajai-ag2,sql-p1bvt-ag-sql25win25-eacan,p1-sql25ws25-0
