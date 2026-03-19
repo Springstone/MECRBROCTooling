@@ -173,6 +173,20 @@ ERROR HANDLING
   - Unregister script missing: Script exits with path guidance.
 
 
+API VERSION
+-----------
+  Uses Unregister-SQLIaaSVM-FromVault.ps1 which uses: 2025-08-01
+
+
+RECENT FIXES (March 19, 2026)
+-----------------------------
+  - Cross-RG container matching: The inner Unregister script now matches
+    protected items by full container name pattern (including resource
+    group) to prevent operating on databases from VMs with the same name
+    in different resource groups.
+  - Results CSV: Machine name now included in default results filename.
+
+
 PUBLIC DOCUMENTATION
 --------------------
   Azure Backup REST API:

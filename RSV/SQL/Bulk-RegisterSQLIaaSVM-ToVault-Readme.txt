@@ -135,6 +135,21 @@ ERROR HANDLING
   - Register script missing: Script exits with path guidance.
 
 
+API VERSION
+-----------
+  Uses Register-SQLIaaSVM-ToVault.ps1 which uses: 2025-08-01
+
+
+RECENT FIXES (March 19, 2026)
+-----------------------------
+  - Cross-RG container matching: The inner Register script now matches
+    protectable containers by containerId and container name pattern
+    (including resource group) to prevent picking up VMs with the same
+    name from different resource groups.
+  - SQL Instance discovery: Fixed FQDN serverName matching issue.
+  - Results CSV: Machine name now included in default results filename.
+
+
 PUBLIC DOCUMENTATION
 --------------------
   Azure Backup REST API:

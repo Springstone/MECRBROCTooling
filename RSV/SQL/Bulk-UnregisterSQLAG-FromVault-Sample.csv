@@ -1,0 +1,4 @@
+VaultSubscriptionId,VaultResourceGroup,VaultName,VMResourceGroup,VMName
+af95aa3c-30fd-41c6-a938-4b3676fc36fb,rg-vault,myVault,rg-sql,sql-ag-node-01
+af95aa3c-30fd-41c6-a938-4b3676fc36fb,rg-vault,myVault,rg-sql,sql-ag-node-02
+af95aa3c-30fd-41c6-a938-4b3676fc36fb,rg-vault,myVault,rg-prod,sql-ag-node-03

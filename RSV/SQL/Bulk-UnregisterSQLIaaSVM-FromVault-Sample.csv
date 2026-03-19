@@ -1,0 +1,4 @@
+VaultSubscriptionId,VaultResourceGroup,VaultName,VMResourceGroup,VMName,InstanceName,DatabaseName,Unregister,StopAll
+af95aa3c-30fd-41c6-a938-4b3676fc36fb,rg-vault,myVault,rg-sql,sql-vm-01,,,true,
+af95aa3c-30fd-41c6-a938-4b3676fc36fb,rg-vault,myVault,rg-sql,sql-vm-02,,,,true
+af95aa3c-30fd-41c6-a938-4b3676fc36fb,rg-vault,myVault,rg-prod,sql-prod-01,MSSQLSERVER,,false,true

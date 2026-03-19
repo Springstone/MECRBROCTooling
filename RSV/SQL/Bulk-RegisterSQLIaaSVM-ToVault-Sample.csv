@@ -1,0 +1,5 @@
+VaultSubscriptionId,VaultResourceGroup,VaultName,VMResourceGroup,VMName,InstanceName,DatabaseName,PolicyName,EnableAutoProtection,AutoProtectAllInstances
+af95aa3c-30fd-41c6-a938-4b3676fc36fb,rg-vault,myVault,rg-sql,sql-vm-01,,,HourlyLogBackup,,true
+af95aa3c-30fd-41c6-a938-4b3676fc36fb,rg-vault,myVault,rg-sql,sql-vm-02,,,HourlyLogBackup,,true
+af95aa3c-30fd-41c6-a938-4b3676fc36fb,rg-vault,myVault,rg-prod,sql-prod-01,MSSQLSERVER,,HourlyLogBackup,true,
+af95aa3c-30fd-41c6-a938-4b3676fc36fb,rg-vault,myVault,rg-dev,sql-dev-01,,SalesDB,DailyFullBackup,,
