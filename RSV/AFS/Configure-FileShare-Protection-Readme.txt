@@ -68,6 +68,15 @@ INPUTS (PROMPTED AT RUNTIME)
   Step 4 — Policy Selection:
     - Choose from discovered Azure File Share backup policies by number
 
+  CAUTION — Policy Tier Behavior:
+    - 'Snapshot' policy       : Backups are stored as snapshots in the Storage
+                                Account only, in the Storage Account region.
+    - 'Vault-Standard' policy : Backups are stored as snapshots in the Storage
+                                Account (Storage Account region) and transferred
+                                to the Recovery Services Vault (Vault region).
+    Verify your policy tier in the Azure Portal before selecting:
+      Recovery Services Vault > Backup Policies > Select Policy and look for 'Backup tier'
+
 
 API VERSION USED
 ----------------
@@ -156,6 +165,9 @@ On success, displays:
   - PROTECTION CONFIGURED SUCCESSFULLY
   - File Share name, Protection State, Health Status, Policy Name
   - Next steps for triggering backups and monitoring
+
+Additionally, the script displays:
+  - DarkYellow: Caution messages (policy tier behavior and portal verification)
 
 
 ERROR HANDLING
