@@ -166,6 +166,10 @@ On success, displays:
   - File Share name, Protection State, Health Status, Policy Name
   - Next steps for triggering backups and monitoring
 
+Note: After configure protection, the protection state may show as
+'IRPending' (Initial Recovery Pending). This is normal — it means
+protection is configured and the first backup is pending.
+
 Additionally, the script displays:
   - DarkYellow: Caution messages (policy tier behavior and portal verification)
 
