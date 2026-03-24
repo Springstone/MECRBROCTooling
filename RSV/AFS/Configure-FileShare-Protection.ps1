@@ -572,8 +572,7 @@ try {
             try {
                 $statusCheck = Invoke-RestMethod -Uri $enableProtectionUri -Method GET -Headers $headers
                 
-                if ($statusCheck.properties.protectionState -ne "Invalid" -and 
-                    $statusCheck.properties.protectionState -ne "IRPending") {
+                if ($statusCheck.properties.protectionState -ne "Invalid") {
                     $completed = $true
                     
                     Write-Host ""
